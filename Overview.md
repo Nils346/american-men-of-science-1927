@@ -1,4 +1,4 @@
-# This page has moved
+# Overview
 
 **Pipeline documentation:** [README.md](README.md)
 
