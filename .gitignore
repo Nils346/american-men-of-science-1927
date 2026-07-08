@@ -10,6 +10,9 @@ scientist_mobility_panel.csv
 scientist_events_long.csv
 scientist_summary.csv
 
+# Hand-coded institution gazetteer (regenerated with merge_institution_locations.py --export)
+institution_locations.csv
+
 # Debug renders and failed-parse dumps
 debug/
 

@@ -129,6 +129,8 @@ To study migration without guessing, code locations yourself:
 ```powershell
 # 1. After extraction, export every unique institution string:
 python merge_institution_locations.py --export
+#    (creates institution_locations.csv from institution_locations.example.csv
+#     if the file does not exist yet)
 
 # 2. Open institution_locations.csv in Excel; fill city / state_region / country
 #    only where you are confident. Leave blank when unsure.

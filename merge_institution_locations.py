@@ -27,6 +27,7 @@ import pandas as pd
 
 DEFAULT_RAW = "scientists_raw.json"
 DEFAULT_LOCATIONS = "institution_locations.csv"
+DEFAULT_LOCATIONS_EXAMPLE = "institution_locations.example.csv"
 DEFAULT_EVENTS = "scientist_events_long.csv"
 INST_COL = "institution"
 
@@ -55,16 +56,21 @@ def export_locations(raw_path: Path, locations_path: Path) -> None:
     if not raw_path.exists():
         raise SystemExit(f"Missing {raw_path.name}. Run extraction first.")
 
+    if not locations_path.exists():
+        example = locations_path.parent / DEFAULT_LOCATIONS_EXAMPLE
+        if example.exists():
+            locations_path.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            locations_path.write_text(
+                "institution,city,state_region,country,notes\n", encoding="utf-8"
+            )
+
     discovered = sorted(collect_institutions(raw_path))
-    if locations_path.exists():
-        existing = pd.read_csv(locations_path, dtype=str).fillna("")
-        if INST_COL not in existing.columns:
-            raise SystemExit(f"{locations_path.name} must have an '{INST_COL}' column.")
-        coded = set(existing[INST_COL].str.strip())
-        rows = existing.to_dict("records")
-    else:
-        coded = set()
-        rows = []
+    existing = pd.read_csv(locations_path, dtype=str).fillna("")
+    if INST_COL not in existing.columns:
+        raise SystemExit(f"{locations_path.name} must have an '{INST_COL}' column.")
+    coded = set(existing[INST_COL].str.strip())
+    rows = existing.to_dict("records")
 
     new_names = [n for n in discovered if n not in coded]
     for name in new_names:

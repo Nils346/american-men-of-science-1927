@@ -1,0 +1,4 @@
+institution,city,state_region,country,notes
+Brown,Providence,R.I.,USA,example — fill only when confident
+Yale,New Haven,Conn.,USA,
+Inst. Parasitol,,,Peru,country printed explicitly in directory
