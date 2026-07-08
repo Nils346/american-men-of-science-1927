@@ -1,6 +1,6 @@
 # American Men (and Women) of Science — Editions
 
-Links to publicly available PDFs and edition notes.
+Links to publicly available access to different editions. PDFs are available for download up to the 4th edition (1927).
 
 ## Pre-WWII: Single-Volume Editions
 
