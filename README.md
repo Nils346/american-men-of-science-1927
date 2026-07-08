@@ -4,6 +4,9 @@
 (1927) directory into a long-format Scientist-Year-Event panel
 (`scientist_mobility_panel.csv`) using the Anthropic Claude vision API.
 
+**Source material:** [EDITIONS.md](EDITIONS.md) (PDF links) ·
+[DIRECTORY_REFERENCE.md](DIRECTORY_REFERENCE.md) (field notes for the 1927 volume)
+
 ## Setup
 
 ```powershell
