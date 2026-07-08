@@ -1,0 +1,5 @@
+pymupdf>=1.28
+anthropic>=0.116
+pydantic>=2.13
+pandas>=3.0
+tenacity>=9.1
