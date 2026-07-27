@@ -5,6 +5,7 @@
 extraction_checkpoint.jsonl
 failed_pages.log
 pipeline.log
+rerun.log
 scientists_raw.json
 scientist_mobility_panel.csv
 scientist_events_long.csv
