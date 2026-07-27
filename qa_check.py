@@ -40,6 +40,8 @@ from typing import Optional
 
 import fitz  # PyMuPDF
 
+from profile_merge import merge_page_attempts, surname_of
+
 CHECKPOINT_FILE = "extraction_checkpoint.jsonl"
 DEFAULT_PDF = "American Men of Science_4th edition_1927.pdf"
 FINDINGS_CSV = "qa_findings.csv"
@@ -80,9 +82,11 @@ class Finding:
 # Loading
 # ---------------------------------------------------------------------------
 
-def load_pages(path: Path) -> dict[int, list[dict]]:
-    """Latest successful record per focus page -> its list of profiles."""
-    pages: dict[int, list[dict]] = {}
+def load_pages(path: Path, doc: Optional[fitz.Document] = None) -> dict[int, list[dict]]:
+    """Focus page -> its profiles, unioned across every pass, exactly as
+    extract_panel builds the panel. Auditing the last pass instead would report
+    on data the CSVs never contained."""
+    attempts: dict[int, list[list[dict]]] = defaultdict(list)
     with path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -90,17 +94,63 @@ def load_pages(path: Path) -> dict[int, list[dict]]:
                 continue
             rec = json.loads(line)
             if rec.get("status") == "ok":
-                pages[int(rec["focus_page_number"])] = rec.get("scientists", [])
+                attempts[int(rec["focus_page_number"])].append(rec.get("scientists", []))
+
+    pages: dict[int, list[dict]] = {}
+    for page, passes in attempts.items():
+        confirms = None
+        if doc is not None:
+            text = squashed_text(doc, page)
+            if text:
+                confirms = lambda s, t=text: printed_count(t, s)   # noqa: E731
+        pages[page] = merge_page_attempts(passes, confirms)
     return pages
-
-
-def surname_of(profile: dict) -> str:
-    return (profile.get("full_name") or "").split(",")[0].strip()
 
 
 def squashed_text(doc: fitz.Document, page_1based: int) -> str:
     text = re.sub(r"\s+", "", doc[page_1based - 1].get_text())
     return RUNNING_HEADER.sub("", text)
+
+
+def entry_start_candidates(text: str) -> set[str]:
+    """Surnames the text layer thinks start an entry on this page."""
+    found: set[str] = set()
+    for pattern in ENTRY_START_PATTERNS:
+        found.update(pattern.findall(text))
+    return found
+
+
+def printed_count(text: str, surname: str) -> int:
+    return len(re.findall(re.escape(surname) + ",", text))
+
+
+def find_omissions(text: str, returned: Counter, window: tuple[str, str]
+                   ) -> list[tuple[str, int, int]]:
+    """Surnames the page prints more often than the extraction returned them.
+
+    Returns (surname, n_printed, n_returned). Candidates are restricted to the
+    alphabetical window so OCR debris -- glued running headers, hyphenated line
+    breaks -- does not register as a missing scientist.
+    """
+    if not text:
+        return []
+    lo, hi = window
+    out: list[tuple[str, int, int]] = []
+
+    for surname in sorted(entry_start_candidates(text)):
+        if not lo <= surname.lower() <= hi:
+            continue
+        n_printed = printed_count(text, surname)
+        n_returned = returned.get(surname, 0)
+        if n_returned == 0:
+            # The model may have returned the same entry under a misread
+            # surname; credit the closest spelling it did return.
+            close = difflib.get_close_matches(surname, list(returned), n=1, cutoff=0.75)
+            if close:
+                n_returned = returned[close[0]]
+        if n_printed > n_returned:
+            out.append((surname, n_printed, n_returned))
+    return out
 
 
 def alphabetical_window(pages: dict[int, list[dict]], page: int) -> tuple[str, str]:
@@ -141,15 +191,13 @@ def check_against_text_layer(page: int, profiles: list[dict], text: str,
     returned = Counter(surname_of(p) for p in profiles if surname_of(p))
 
     def printed(surname: str) -> int:
-        return len(re.findall(re.escape(surname) + ",", text))
+        return printed_count(text, surname)
 
     # Surnames the model invented, and entry starts it never returned.
     unprinted = sorted(s for s in returned if printed(s) == 0)
 
     lo, hi = window
-    candidates: set[str] = set()
-    for pattern in ENTRY_START_PATTERNS:
-        candidates.update(pattern.findall(text))
+    candidates = entry_start_candidates(text)
     # The directory is alphabetical, so a real entry on this page has to sort
     # inside the window its neighbours define. Anything else is OCR debris.
     unreturned = sorted(c for c in candidates - set(returned) if lo <= c.lower() <= hi)
@@ -373,7 +421,17 @@ def main() -> None:
         print("No checkpoint at %s -- run the extraction first." % ckpt)
         sys.exit(1)
 
-    pages = load_pages(ckpt)
+    pdf = Path(args.pdf)
+    if not pdf.is_absolute():
+        pdf = base / pdf
+    doc = None
+    if not args.no_text_layer:
+        if pdf.exists():
+            doc = fitz.open(pdf)
+        else:
+            print("PDF not found at %s -- skipping the text-layer cross-check.\n" % pdf)
+
+    pages = load_pages(ckpt, doc)
     if args.pages:
         lo, hi = args.pages
         pages = {p: v for p, v in pages.items() if lo <= p <= hi}
@@ -383,18 +441,11 @@ def main() -> None:
 
     findings: list[Finding] = []
 
-    if not args.no_text_layer:
-        pdf = Path(args.pdf)
-        if not pdf.is_absolute():
-            pdf = base / pdf
-        if pdf.exists():
-            doc = fitz.open(pdf)
-            for page in sorted(pages):
-                check_against_text_layer(page, pages[page], squashed_text(doc, page),
-                                         alphabetical_window(pages, page), findings)
-            doc.close()
-        else:
-            print("PDF not found at %s -- skipping the text-layer cross-check.\n" % pdf)
+    if doc is not None:
+        for page in sorted(pages):
+            check_against_text_layer(page, pages[page], squashed_text(doc, page),
+                                     alphabetical_window(pages, page), findings)
+        doc.close()
 
     check_ordering(pages, findings)
     check_page_yield(pages, findings)

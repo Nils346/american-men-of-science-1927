@@ -34,13 +34,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import json
 import logging
 import os
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -66,6 +67,9 @@ from tenacity import (
     wait_exponential,
 )
 
+import qa_check  # shared text-layer detector (no API calls)
+from profile_merge import merge_page_attempts
+
 # ---------------------------------------------------------------------------
 # Constants & defaults
 # ---------------------------------------------------------------------------
@@ -75,6 +79,7 @@ DEFAULT_MODEL = "gpt-5.6-terra"   # Sonnet-tier peer on both quality and price
 DEFAULT_DPI = 150            # ~1100 x 1580 px per page: near the 1568px optimal long edge
 DEFAULT_MAX_TOKENS = 32000   # dense pages can hold 25+ profiles
 DEFAULT_REASONING_EFFORT = "low"  # transcription work: keep billed reasoning tokens down
+DEFAULT_MAX_PASSES = 2       # a 2nd pass runs only when a page looks short
 DEFAULT_START_PAGE = 14      # 1-based PDF page where the scientist listing begins
 DEFAULT_END_PAGE = 1123      # 1-based PDF page where the listing ends
 DIRECTORY_YEAR = 1927        # edition year: current (italic) positions run up to here
@@ -686,6 +691,41 @@ def save_debug_artifact(debug_dir: Path, page: int, raw_text: str, label: str) -
 # Extraction loop
 # ---------------------------------------------------------------------------
 
+def verify_page(page_text: str, profiles: list[dict]) -> list[tuple[str, int, int]]:
+    """Surnames the page prints more often than this pass returned them.
+
+    Uses the PDF's own OCR text layer, so it costs nothing. The window is the
+    pass's own surname range, which means an entry dropped from the very top or
+    bottom of a page is not caught here -- qa_check.py, which can see the
+    neighbouring pages, catches those afterwards.
+    """
+    if not page_text or not profiles:
+        return []
+    surnames = [(p.get("full_name") or "").split(",")[0].strip() for p in profiles]
+    surnames = [s for s in surnames if s]
+    if not surnames:
+        return []
+    window = (min(s.lower() for s in surnames), max(s.lower() for s in surnames))
+    return qa_check.find_omissions(page_text, Counter(surnames), window)
+
+
+def collect_page_attempts(checkpoint_path: Path, page: int) -> list[list[dict]]:
+    """Every successful pass recorded for one focus page, in order."""
+    attempts: list[list[dict]] = []
+    with checkpoint_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("status") == "ok" and int(rec["focus_page_number"]) == page:
+                attempts.append(rec.get("scientists", []))
+    return attempts
+
+
 def run_extraction(args, base_dir: Path) -> None:
     checkpoint_path = base_dir / CHECKPOINT_FILE
     failed_log_path = base_dir / FAILED_PAGES_LOG
@@ -770,25 +810,52 @@ def run_extraction(args, base_dir: Path) -> None:
 
         raw_text = ""
         try:
-            raw_text, usage = client.extract_page(page, focus_png, lookahead_png)
-            container = parse_llm_json(raw_text)
-            container.focus_page_number = page    # trust our loop, not the model
+            page_text = "" if args.no_verify else qa_check.squashed_text(doc, page)
+            profiles: list[dict] = []
 
-            record = {
-                "focus_page_number": page,
-                "status": "ok",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "n_scientists": len(container.scientists),
-                "usage": usage,
-                "scientists": [s.model_dump() for s in container.scientists],
-            }
-            append_checkpoint(checkpoint_path, record)
+            for attempt in range(1, max(1, args.max_passes) + 1):
+                raw_text, usage = client.extract_page(page, focus_png, lookahead_png)
+                container = parse_llm_json(raw_text)
+                container.focus_page_number = page   # trust our loop, not the model
+                profiles = [s.model_dump() for s in container.scientists]
+
+                record = {
+                    "focus_page_number": page,
+                    "status": "ok",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "n_scientists": len(profiles),
+                    "pass": attempt,
+                    "usage": usage,
+                    "scientists": profiles,
+                }
+                append_checkpoint(checkpoint_path, record)
+
+                omissions = verify_page(page_text, profiles)
+                if not omissions or attempt >= args.max_passes:
+                    if omissions:
+                        logger.warning(
+                            "Page %d still looks short after %d pass(es): %s. "
+                            "Recorded anyway; qa_check.py will flag it.",
+                            page, attempt,
+                            ", ".join("%s x%d vs %d" % o for o in omissions))
+                    break
+                logger.warning(
+                    "Page %d pass %d looks short (%s); re-running the page and "
+                    "merging the results.", page, attempt,
+                    ", ".join("%s x%d vs %d" % o for o in omissions))
+
+            page_attempts = collect_page_attempts(checkpoint_path, page)
+            merged = merge_page_attempts(
+                page_attempts,
+                (lambda s: qa_check.printed_count(page_text, s)) if page_text else None)
             n_ok += 1
-            n_scientists += len(container.scientists)
+            n_scientists += len(merged)
+            container_len = len(merged)
             logger.info(
-                "[%d/%d] Page %d OK: %d scientists | tokens in=%d (cached %d) "
+                "[%d/%d] Page %d OK: %d scientists%s | tokens in=%d (cached %d) "
                 "out=%d (reasoning %d) | cumulative in=%d out=%d | checkpoint written.",
-                i, len(remaining), page, len(container.scientists),
+                i, len(remaining), page, container_len,
+                " after %d passes" % len(page_attempts) if len(page_attempts) > 1 else "",
                 usage["input_tokens"], usage["cached_input_tokens"],
                 usage["output_tokens"], usage["reasoning_tokens"],
                 client.total_input_tokens, client.total_output_tokens,
@@ -1103,9 +1170,24 @@ def clean_display_name(full_name: str) -> str:
     return first or last or (full_name or "").strip()
 
 
-def load_profiles_from_checkpoint(checkpoint_path: Path) -> list[dict]:
-    """Read every successful checkpoint line; keep the LATEST record per page."""
-    by_page: dict[int, dict] = {}
+def page_confirmer(doc, page: int):
+    """A `surname -> times printed on this page` lookup, or None without a PDF.
+
+    Lets the merge repair a mangled surname by preferring the spelling the
+    page's own text layer backs up.
+    """
+    if doc is None:
+        return None
+    text = qa_check.squashed_text(doc, page)
+    if not text:
+        return None
+    return lambda surname: qa_check.printed_count(text, surname)
+
+
+def load_profiles_from_checkpoint(checkpoint_path: Path,
+                                  pdf_path: Optional[Path] = None) -> list[dict]:
+    """Read every successful checkpoint line and UNION the passes for each page."""
+    attempts: dict[int, list[list[dict]]] = defaultdict(list)
     with checkpoint_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -1116,13 +1198,29 @@ def load_profiles_from_checkpoint(checkpoint_path: Path) -> list[dict]:
             except json.JSONDecodeError:
                 continue
             if rec.get("status") == "ok":
-                by_page[int(rec["focus_page_number"])] = rec
+                attempts[int(rec["focus_page_number"])].append(rec.get("scientists", []))
+
+    doc = None
+    if pdf_path and pdf_path.exists():
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception:                                  # noqa: BLE001
+            doc = None
 
     profiles: list[dict] = []
-    for page in sorted(by_page):
-        for s in by_page[page].get("scientists", []):
+    for page in sorted(attempts):
+        passes = attempts[page]
+        merged = merge_page_attempts(passes, page_confirmer(doc, page))
+        if len(passes) > 1:
+            logger.info("Page %d: merged %d passes -> %d unique scientists "
+                        "(largest single pass had %d).",
+                        page, len(passes), len(merged), max(len(p) for p in passes))
+        for s in merged:
             s["_source_page"] = page
             profiles.append(s)
+
+    if doc:
+        doc.close()
     return profiles
 
 
@@ -1376,13 +1474,13 @@ def build_summary(profiles: list[dict]) -> pd.DataFrame:
     return df
 
 
-def run_panel_transformation(base_dir: Path) -> None:
+def run_panel_transformation(base_dir: Path, pdf_path: Optional[Path] = None) -> None:
     checkpoint_path = base_dir / CHECKPOINT_FILE
     if not checkpoint_path.exists():
         logger.error("No checkpoint file at %s -- run the extraction first.", checkpoint_path)
         sys.exit(1)
 
-    profiles = load_profiles_from_checkpoint(checkpoint_path)
+    profiles = load_profiles_from_checkpoint(checkpoint_path, pdf_path)
     logger.info("Loaded %d scientist profiles from the checkpoint.", len(profiles))
     if not profiles:
         logger.warning("Nothing to transform; skipping panel build.")
@@ -1448,6 +1546,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Reasoning effort for GPT-5.x models. Reasoning tokens "
                              "are billed as output; '' omits the parameter entirely "
                              "for models that do not support it.")
+    parser.add_argument("--max-passes", type=int, default=DEFAULT_MAX_PASSES,
+                        help="Maximum extraction passes per page. A second pass runs "
+                             "only when the PDF's text layer says the first one "
+                             "missed an entry; results are merged as a union.")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="Skip the free text-layer omission check (implies a "
+                             "single pass per page).")
     parser.add_argument("--dpi", type=int, default=DEFAULT_DPI,
                         help="Rendering resolution for page images.")
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
@@ -1491,11 +1596,15 @@ def main() -> None:
                 path.unlink()
                 logger.info("--fresh: removed %s.", name)
 
+    pdf_path = Path(args.pdf)
+    if not pdf_path.is_absolute():
+        pdf_path = base_dir / pdf_path
+
     if not args.panel_only:
         run_extraction(args, base_dir)
 
     if not args.dry_run:
-        run_panel_transformation(base_dir)
+        run_panel_transformation(base_dir, pdf_path)
 
     logger.info("Pipeline complete.")
 

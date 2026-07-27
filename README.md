@@ -232,6 +232,26 @@ Omissions are not confined to page edges. Sample page 83 dropped an entry from
 the *middle* of a column, and the 10-page sample contained **4 missed entries
 across 125 profiles (~3%)** plus **5 corrupted surnames**.
 
+The drops are not uniformly random: they concentrate on **runs of repeated
+surnames**. A page printing Beckwith five times, Behre three times or Bean four
+times is where entries go missing — the model collapses the run and loses count.
+Pages of distinct surnames extract cleanly.
+
+**Multi-pass merge (on by default).** After each page the text layer is consulted
+for free; if it says the pass came up short, the page is extracted again and the
+passes are merged as a *union* (`--max-passes`, default 2, `--no-verify` to turn
+off). Because the drops are near-random, two passes rarely lose the same
+scientist. The merge also repairs spellings: where two passes disagree, the one
+the text layer confirms wins, so `Boer` becomes `Beer`.
+
+This helps but does not solve the problem, and it introduces a failure of its
+own. On the 10-page sample it recovered several genuinely missed entries, yet
+against the four pages verified by hand it scored no better overall: it fixed
+page 83 (12 → 13, correct) but left page 80 one *over* (a mangled entry that no
+longer matches its twin) and page 84 one *under* (both passes missed the same
+top-of-page entry). Union merging trades omissions for occasional duplicates,
+so `qa_check.py` remains mandatory rather than optional.
+
 Alphabetical ordering alone does **not** catch this. Ordering detects overlaps
 and duplicates, but a gap in the alphabet is indistinguishable from two
 genuinely adjacent surnames, so a dropped entry leaves the chain intact. Use
@@ -252,4 +272,6 @@ other sources: the errors seen so far mangle the *end* of the name
 | `--reasoning-effort` | `low` | `none`/`low`/`medium`/`high`/`xhigh`; billed as output tokens |
 | `--dpi` | 150 | Page image resolution |
 | `--max-tokens` | 32000 | Output token cap per call (raise if pages truncate) |
+| `--max-passes` | 2 | Extra passes for pages the text layer says came up short |
+| `--no-verify` | off | Skip the free omission check (one pass per page) |
 | `--api-key` | `$OPENAI_API_KEY` | OpenAI API key |
