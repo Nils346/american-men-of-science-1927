@@ -9,6 +9,7 @@ scientists_raw.json
 scientist_mobility_panel.csv
 scientist_events_long.csv
 scientist_summary.csv
+qa_findings.csv
 
 # Hand-coded institution gazetteer (regenerated with merge_institution_locations.py --export)
 institution_locations.csv

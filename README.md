@@ -188,6 +188,37 @@ The checkpoint makes the run fully resumable, so interrupting it is safe.
 Re-run cost check after more pages: token totals are logged per page in
 `pipeline.log` and stored in `extraction_checkpoint.jsonl` under `usage`.
 
+## Quality control (`qa_check.py`)
+
+```powershell
+python qa_check.py                  # everything, writes qa_findings.csv
+python qa_check.py --severity error # only near-certain problems
+python qa_check.py --pages 75 84    # one range
+```
+
+Makes **no API calls**, so run it as often as you like. It exists because the
+pipeline's worst failure mode is silent: the model sometimes drops an entry or
+mangles a surname and still reports success, so `failed_pages.log` stays empty.
+
+The strongest check exploits the fact that the PDF carries its **own OCR text
+layer**. That layer is far too fragmented to extract structured data from, but it
+is an *independent* reading of the same page, so disagreement is a reliable
+review trigger. Concretely, on the 10-page sample it caught every error that
+hand-checking had found, plus three that hand-checking had missed:
+
+| Finding | Meaning |
+| --- | --- |
+| `entry_possibly_missed` | The page prints an entry the model never returned |
+| `surname_misread` | Model spelling vs printed spelling disagree (`Boer` / `Beer`) |
+| `surname_not_printed` | Returned a surname the page never prints |
+| `milestone_before_adulthood` | A degree or post dated before age 15 — in practice a misread birth year |
+| `page_overlap`, `duplicate_scientist` | The same entry captured on two pages |
+
+Candidate surnames are filtered to the alphabetical window the neighbouring pages
+define, which discards the OCR debris (glued running headers, hyphenated line
+breaks) that would otherwise dominate the output. The script exits non-zero when
+any page looks worth re-extracting and prints that page list.
+
 ## Known accuracy limit: page-boundary drift
 
 Repeated extractions of the *same* page do not always return the same set of
@@ -197,12 +228,19 @@ focus page and occasional leakage of an entry from the look-ahead page. Effort
 levels `low`, `medium` and `high` all showed the drift, so it is not fixed by
 spending more on reasoning.
 
-This matters because it is **silent** — nothing lands in `failed_pages.log`.
-The cheap detector is alphabetical continuity: the directory is strictly
-alphabetical, so the first entry of page N should follow the last entry of page
-N−1 with no gap and no overlap. Nine of the ten sample pages chained perfectly;
-the one bad page showed up immediately as a gap. Worth running as a QA pass over
-the full extraction before treating the panel as final.
+Omissions are not confined to page edges. Sample page 83 dropped an entry from
+the *middle* of a column, and the 10-page sample contained **4 missed entries
+across 125 profiles (~3%)** plus **5 corrupted surnames**.
+
+Alphabetical ordering alone does **not** catch this. Ordering detects overlaps
+and duplicates, but a gap in the alphabet is indistinguishable from two
+genuinely adjacent surnames, so a dropped entry leaves the chain intact. Use
+`qa_check.py`, whose text-layer cross-check does detect omissions, and re-extract
+the pages it flags before treating the panel as final.
+
+Corrupted surnames deserve particular attention if the panel will be linked to
+other sources: the errors seen so far mangle the *end* of the name
+(`Behre`→`Behr`, `Beghtel`→`Beghte`, `Bawden`→`Bawen`, `Belfield`→`Belsfield`).
 
 ## Key CLI options
 
