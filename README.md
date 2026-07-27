@@ -2,7 +2,7 @@
 
 `extract_panel.py` extracts the ~13,500 biographical entries of the 4th Edition
 (1927) directory into a long-format Scientist-Year-Event panel
-(`scientist_mobility_panel.csv`) using the Anthropic Claude vision API.
+(`scientist_mobility_panel.csv`) using the OpenAI vision API.
 
 **Source material:** [EDITIONS.md](EDITIONS.md) (PDF links) ·
 [DIRECTORY_REFERENCE.md](DIRECTORY_REFERENCE.md) (field notes for the 1927 volume)
@@ -11,7 +11,7 @@
 
 ```powershell
 pip install -r requirements.txt
-$env:ANTHROPIC_API_KEY = "sk-ant-..."   # or pass --api-key
+$env:OPENAI_API_KEY = "sk-..."          # or pass --api-key
 ```
 
 Place the PDF in the project folder as
@@ -43,11 +43,14 @@ python extract_panel.py --fresh --pages 14 1123
   and page N+1 (look-ahead). Only entries that *begin* on the focus page are
   extracted; entries spilling onto N+1 are completed from the look-ahead image,
   and entries continued from N−1 are ignored (already captured).
-- **Validation:** every response is parsed against a strict Pydantic schema
+- **Validation:** the request pins a strict JSON Schema via OpenAI Structured
+  Outputs, and the reply is re-parsed against the matching Pydantic contract
   (`PageExtractionContainer` → `ScientistProfile` → degree/employment records).
 - **Fault tolerance:** exponential-backoff retries (up to 5) on 429/5xx/network
   errors via `tenacity`; truncated or unparseable responses are logged to
   `failed_pages.log` with raw output saved under `debug/`, and the run continues.
+  A rejected key fails fast — the model is checked once before any page is sent,
+  and an auth error mid-run aborts instead of burning through the remaining pages.
 - **Checkpointing & resume:** each successful page window is appended to
   `extraction_checkpoint.jsonl` (fsync'd). Re-running the same command skips
   completed pages automatically and retries failed ones.
@@ -145,26 +148,61 @@ python merge_institution_locations.py --apply
 This adds `institution_city`, `institution_state_region`, and `institution_country`
 to `scientist_events_long.csv` for exact institution-string matches only.
 
+## Model choice
+
+The default is **`gpt-5.6-terra`**, the closest OpenAI counterpart to the
+Sonnet-tier model this pipeline originally used — both on price
+($2.50 / $15 per M input/output vs Sonnet 5's $3 / $15) and on positioning
+(OpenAI describes Terra as "everyday production work at near-Sol quality").
+`gpt-5.6-sol` doubles the input price for frontier reasoning that transcription
+does not need; `gpt-5.6-luna` is the cheap tier worth testing if the budget
+tightens. Any vision-capable OpenAI model works via `--model`.
+
+Reasoning tokens are billed as output, so `--reasoning-effort` defaults to
+`low`. Raising it did **not** measurably improve boundary accuracy in testing
+(see below) but did roughly double the output tokens.
+
 ## API budget estimate (full listing, pages 14–1123)
 
-Based on **4 measured pages** (15, 16, 20, 21) with `claude-sonnet-5` at 150 DPI:
+Based on **10 measured pages** (75–84) with `gpt-5.6-terra` at 150 DPI,
+reasoning effort `low`:
 
 | Metric | Value |
 | --- | --- |
 | Focus pages | 1,110 |
-| Avg input tokens / page | ~4,650 |
-| Avg output tokens / page | ~6,700 |
-| Scientists / page | ~9 |
+| Avg input tokens / page | ~7,240 (~3,000 served from cache) |
+| Avg output tokens / page | ~5,500 (~1,000 of them reasoning) |
+| Scientists / page | ~12.3 |
+| Wall-clock / page | ~45 s |
 
 | Pricing tier | Estimated total |
 | --- | ---: |
-| **Intro** ($2 / $10 per M input/output) through Aug 2026 | **~$85** |
-| Standard ($3 / $15 per M) from Sep 2026 | ~$128 |
-| Batch API (50% off intro pricing) | ~$43 |
-| Recommended budget request (+10% buffer / retries) | **~$95** |
+| **Standard** ($2.50 / $15 per M, incl. cached-input discount) | **~$104** |
+| Batch API (50% off) | ~$52 |
+| Recommended budget request (+10% buffer / retries) | **~$115** |
+
+At ~45 s per page a sequential full run takes roughly **14 hours**. Run it
+overnight, or use the Batch API, which halves the price at the cost of latency.
+The checkpoint makes the run fully resumable, so interrupting it is safe.
 
 Re-run cost check after more pages: token totals are logged per page in
 `pipeline.log` and stored in `extraction_checkpoint.jsonl` under `usage`.
+
+## Known accuracy limit: page-boundary drift
+
+Repeated extractions of the *same* page do not always return the same set of
+entries. On sample page 84 (12 entries by hand count) five runs returned 10, 11,
+11, 12 and 12 entries. The failure modes are dropped entries at the top of the
+focus page and occasional leakage of an entry from the look-ahead page. Effort
+levels `low`, `medium` and `high` all showed the drift, so it is not fixed by
+spending more on reasoning.
+
+This matters because it is **silent** — nothing lands in `failed_pages.log`.
+The cheap detector is alphabetical continuity: the directory is strictly
+alphabetical, so the first entry of page N should follow the last entry of page
+N−1 with no gap and no overlap. Nine of the ten sample pages chained perfectly;
+the one bad page showed up immediately as a gap. Worth running as a QA pass over
+the full extraction before treating the panel as final.
 
 ## Key CLI options
 
@@ -172,7 +210,8 @@ Re-run cost check after more pages: token totals are logged per page in
 | --- | --- | --- |
 | `--pages START END` | 14 1123 | Inclusive 1-based PDF page range of focus pages |
 | `--test-run` | off | Restrict to the first 2 focus pages of the range |
-| `--model` | `claude-sonnet-5` | Anthropic model ID |
+| `--model` | `gpt-5.6-terra` | OpenAI model ID |
+| `--reasoning-effort` | `low` | `none`/`low`/`medium`/`high`/`xhigh`; billed as output tokens |
 | `--dpi` | 150 | Page image resolution |
 | `--max-tokens` | 32000 | Output token cap per call (raise if pages truncate) |
-| `--api-key` | `$ANTHROPIC_API_KEY` | Anthropic API key |
+| `--api-key` | `$OPENAI_API_KEY` | OpenAI API key |

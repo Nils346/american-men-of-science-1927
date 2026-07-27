@@ -2,14 +2,15 @@
 extract_panel.py
 ================
 Production pipeline for extracting structured scientist biographies from the
-"American Men of Science" 4th Edition (1927) directory PDF using the Anthropic
-Claude vision API, and transforming them into a long-format Scientist-Year-Event
-panel CSV for econometric analysis (Stata / R).
+"American Men of Science" 4th Edition (1927) directory PDF using the OpenAI
+vision API (Responses endpoint), and transforming them into a long-format
+Scientist-Year-Event panel CSV for econometric analysis (Stata / R).
 
 Pipeline phases
 ---------------
 1. PDF chunking with a "Focus + Look-Ahead" 2-page window (PyMuPDF page images).
-2. Claude API extraction validated against a strict Pydantic data contract.
+2. OpenAI API extraction constrained by a strict JSON Schema (Structured
+   Outputs) and re-validated against a Pydantic data contract.
 3. Fault tolerance: exponential-backoff retries, truncation detection, debug
    dumps, failed-page logging, and JSONL checkpointing with automatic resume.
 4. Flattening of the nested JSON records into scientist_mobility_panel.csv.
@@ -46,12 +47,14 @@ from typing import List, Optional
 
 import fitz  # PyMuPDF
 import pandas as pd
-from anthropic import (
-    Anthropic,
+from openai import (
+    OpenAI,
     APIConnectionError,
     APIStatusError,
     APITimeoutError,
+    AuthenticationError,
     BadRequestError,
+    PermissionDeniedError,
     RateLimitError,
 )
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -68,9 +71,10 @@ from tenacity import (
 # ---------------------------------------------------------------------------
 
 DEFAULT_PDF = "American Men of Science_4th edition_1927.pdf"
-DEFAULT_MODEL = "claude-sonnet-5"
-DEFAULT_DPI = 150            # ~1100 x 1580 px per page: near Claude's optimal 1568px long edge
+DEFAULT_MODEL = "gpt-5.6-terra"   # Sonnet-tier peer on both quality and price
+DEFAULT_DPI = 150            # ~1100 x 1580 px per page: near the 1568px optimal long edge
 DEFAULT_MAX_TOKENS = 32000   # dense pages can hold 25+ profiles
+DEFAULT_REASONING_EFFORT = "low"  # transcription work: keep billed reasoning tokens down
 DEFAULT_START_PAGE = 14      # 1-based PDF page where the scientist listing begins
 DEFAULT_END_PAGE = 1123      # 1-based PDF page where the listing ends
 DIRECTORY_YEAR = 1927        # edition year: current (italic) positions run up to here
@@ -330,9 +334,10 @@ You receive images of TWO consecutive PDF pages:
    NOT break the chronological chain of primary jobs, it is a minor position.
    Return each as an OBJECT with position_title, institution_org (null if none),
    start_year, end_year (expand 2-digit years; leave end_year null if a single
-   year or open-ended). Null if none.
+   year or open-ended). Empty array if none.
 10. societies: memberships in scientific societies, kept as the printed
     abbreviations (e.g. "A.A.", "Soc. Mammal", "F.A.A."), one string per society.
+    Empty array if none.
 11. Research: the final block lists research SUBJECTS/TOPICS (e.g. "Ecology; light
     reactions of land isopods"). Topics BEFORE the dash (-) -> research_accomplished;
     topics AFTER the dash -> research_in_progress. If there is no dash, put everything
@@ -368,8 +373,8 @@ Return exactly one JSON object matching this schema (no extra keys, no markdown)
                       "start_year": <int>|null, "end_year": <int>|null,
                       "is_current_position": true|false}],
       "minor_positions": [{"position_title": "...", "institution_org": "..."|null,
-                           "start_year": <int>|null, "end_year": <int>|null}] | null,
-      "societies": ["..."] | null,
+                           "start_year": <int>|null, "end_year": <int>|null}],
+      "societies": ["..."],
       "research_accomplished": "..." | null,
       "research_in_progress": "..." | null
     }
@@ -380,12 +385,16 @@ return {"focus_page_number": <int>, "scientists": []}.
 """
 
 
+def _png_data_url(png: bytes) -> str:
+    return "data:image/png;base64," + base64.standard_b64encode(png).decode("ascii")
+
+
 def build_user_content(focus_page_1based: int, focus_png: bytes,
                        lookahead_png: Optional[bytes]) -> list:
     """Assemble the multimodal user message for one Focus + Look-Ahead window."""
     content = [
         {
-            "type": "text",
+            "type": "input_text",
             "text": (
                 f"FOCUS PAGE = PDF page {focus_page_1based} (Image 1). "
                 + (f"LOOK-AHEAD PAGE = PDF page {focus_page_1based + 1} (Image 2). "
@@ -396,25 +405,91 @@ def build_user_content(focus_page_1based: int, focus_png: bytes,
                   f"Return ONLY the JSON object."
             ),
         },
-        {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": base64.standard_b64encode(focus_png).decode("ascii"),
-            },
-        },
+        # "high" detail keeps the small italic type in the two-column scan legible.
+        {"type": "input_image", "image_url": _png_data_url(focus_png), "detail": "high"},
     ]
     if lookahead_png:
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": base64.standard_b64encode(lookahead_png).decode("ascii"),
-            },
-        })
+        content.append({"type": "input_image",
+                        "image_url": _png_data_url(lookahead_png),
+                        "detail": "high"})
     return content
+
+
+# ---------------------------------------------------------------------------
+# Structured Outputs schema
+# ---------------------------------------------------------------------------
+# Mirrors the Pydantic contract above. OpenAI strict mode requires every property
+# to be listed in "required" and forbids additional properties, so optionals are
+# expressed as nullable unions rather than omitted keys.
+
+def _nullable(*types: str) -> dict:
+    return {"type": [*types, "null"]}
+
+
+def _obj(properties: dict) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": list(properties),
+        "properties": properties,
+    }
+
+
+_DEGREE_SCHEMA = _obj({
+    "degree_type": {"type": "string"},
+    "institution": _nullable("string"),
+    "year": _nullable("integer"),
+})
+
+_EMPLOYMENT_SCHEMA = _obj({
+    "position_title": {"type": "string"},
+    "institution_org": _nullable("string"),
+    "start_year": _nullable("integer"),
+    "end_year": _nullable("integer"),
+    "is_current_position": {"type": "boolean"},
+})
+
+_MINOR_POSITION_SCHEMA = _obj({
+    "position_title": {"type": "string"},
+    "institution_org": _nullable("string"),
+    "start_year": _nullable("integer"),
+    "end_year": _nullable("integer"),
+})
+
+_SCIENTIST_SCHEMA = _obj({
+    "full_name": {"type": "string"},
+    "titles": _nullable("string"),
+    "mailing_address": {"type": "string"},
+    "mailing_city": _nullable("string"),
+    "mailing_state": _nullable("string"),
+    "mailing_country": _nullable("string"),
+    "star_status": {"type": "boolean"},
+    "department": {"type": "string"},
+    "birth_place": _nullable("string"),
+    "birth_city": _nullable("string"),
+    "birth_state": _nullable("string"),
+    "birth_country": _nullable("string"),
+    "birth_date": _nullable("string"),
+    "birth_year": _nullable("integer"),
+    "education": {"type": "array", "items": _DEGREE_SCHEMA},
+    "employment": {"type": "array", "items": _EMPLOYMENT_SCHEMA},
+    "minor_positions": {"type": "array", "items": _MINOR_POSITION_SCHEMA},
+    "societies": {"type": "array", "items": {"type": "string"}},
+    "research_accomplished": _nullable("string"),
+    "research_in_progress": _nullable("string"),
+})
+
+PAGE_EXTRACTION_SCHEMA = _obj({
+    "focus_page_number": {"type": "integer"},
+    "scientists": {"type": "array", "items": _SCIENTIST_SCHEMA},
+})
+
+RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "name": "page_extraction",
+    "strict": True,
+    "schema": PAGE_EXTRACTION_SCHEMA,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -429,11 +504,13 @@ def render_page_png(doc: fitz.Document, page_index_0based: int, dpi: int) -> byt
 
 
 # ---------------------------------------------------------------------------
-# Anthropic API interaction
+# OpenAI API interaction
 # ---------------------------------------------------------------------------
 
 def _is_retryable(exc: BaseException) -> bool:
     """Retry on rate limits (429), server errors (5xx), timeouts, and drops."""
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+        return False          # a bad key never fixes itself: fail fast
     if isinstance(exc, (RateLimitError, APIConnectionError, APITimeoutError)):
         return True
     if isinstance(exc, APIStatusError) and exc.status_code >= 500:
@@ -442,25 +519,38 @@ def _is_retryable(exc: BaseException) -> bool:
 
 
 class TruncatedResponseError(Exception):
-    """Raised when the model hit max_tokens before completing the JSON."""
+    """Raised when the model hit max_output_tokens before completing the JSON."""
     def __init__(self, raw_text: str):
-        super().__init__("Response truncated at max_tokens")
+        super().__init__("Response truncated at max_output_tokens")
         self.raw_text = raw_text
 
 
-class ExtractionClient:
-    """Thin wrapper around the Anthropic client with retries and token accounting."""
+class EmptyResponseError(Exception):
+    """Raised when the response carries no JSON text (e.g. a model refusal)."""
 
-    def __init__(self, api_key: str, model: str, max_tokens: int):
-        self.client = Anthropic(api_key=api_key)
+
+class ExtractionClient:
+    """Thin wrapper around the OpenAI client with retries and token accounting."""
+
+    def __init__(self, api_key: str, model: str, max_tokens: int,
+                 reasoning_effort: str = DEFAULT_REASONING_EFFORT):
+        # Dense pages can take minutes to generate; the default 10-minute SDK
+        # timeout is generous but explicit is better across 1,100 calls.
+        self.client = OpenAI(api_key=api_key, timeout=900.0, max_retries=0)
         self.model = model
         self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
         self.total_input_tokens = 0
         self.total_output_tokens = 0
-        # Newer Sonnet models enable adaptive thinking by default; we disable it
-        # for deterministic, token-efficient JSON output. If the target model
-        # rejects the parameter we silently drop it (see _call).
-        self._thinking_supported = True
+        self.total_reasoning_tokens = 0
+        self.total_cached_input_tokens = 0
+        # GPT-5.x reasoning models accept a reasoning.effort hint; older vision
+        # models (gpt-4.1, gpt-4o) reject it. Dropped automatically on refusal.
+        self._reasoning_supported = bool(reasoning_effort)
+
+    def preflight(self) -> None:
+        """Fail fast on a bad key or an inaccessible model before any page work."""
+        self.client.models.retrieve(self.model)
 
     @retry(
         retry=retry_if_exception(_is_retryable),
@@ -472,32 +562,25 @@ class ExtractionClient:
     def _call(self, content: list):
         kwargs = dict(
             model=self.model,
-            max_tokens=self.max_tokens,
-            system=[{
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                # Cache the long system prompt across the hundreds of page calls.
-                "cache_control": {"type": "ephemeral"},
-            }],
-            messages=[{"role": "user", "content": content}],
+            # The long system prompt is identical on every call, so it lands in
+            # OpenAI's automatic prompt cache at a 90% discount after the first page.
+            instructions=SYSTEM_PROMPT,
+            input=[{"role": "user", "content": content}],
+            max_output_tokens=self.max_tokens,
+            text={"format": RESPONSE_FORMAT},
+            store=False,
         )
-        if self._thinking_supported:
-            kwargs["thinking"] = {"type": "disabled"}
+        if self._reasoning_supported:
+            kwargs["reasoning"] = {"effort": self.reasoning_effort}
         try:
-            return self._stream_message(kwargs)
+            return self.client.responses.create(**kwargs)
         except BadRequestError as e:
-            if self._thinking_supported and "thinking" in str(e).lower():
-                logger.warning("Model rejected 'thinking' parameter; retrying without it.")
-                self._thinking_supported = False
-                kwargs.pop("thinking", None)
-                return self._stream_message(kwargs)
+            if self._reasoning_supported and "reasoning" in str(e).lower():
+                logger.warning("Model rejected the 'reasoning' parameter; retrying without it.")
+                self._reasoning_supported = False
+                kwargs.pop("reasoning", None)
+                return self.client.responses.create(**kwargs)
             raise
-
-    def _stream_message(self, kwargs: dict):
-        # The SDK requires streaming for requests whose max_tokens implies a
-        # potential runtime over 10 minutes; stream and return the final message.
-        with self.client.messages.stream(**kwargs) as stream:
-            return stream.get_final_message()
 
     def extract_page(self, focus_page_1based: int, focus_png: bytes,
                      lookahead_png: Optional[bytes]) -> tuple[str, dict]:
@@ -508,19 +591,38 @@ class ExtractionClient:
         content = build_user_content(focus_page_1based, focus_png, lookahead_png)
         response = self._call(content)
 
+        usage_obj = getattr(response, "usage", None)
+        in_details = getattr(usage_obj, "input_tokens_details", None)
+        out_details = getattr(usage_obj, "output_tokens_details", None)
         usage = {
-            "input_tokens": getattr(response.usage, "input_tokens", 0),
-            "output_tokens": getattr(response.usage, "output_tokens", 0),
+            "input_tokens": getattr(usage_obj, "input_tokens", 0) or 0,
+            "output_tokens": getattr(usage_obj, "output_tokens", 0) or 0,
+            "cached_input_tokens": getattr(in_details, "cached_tokens", 0) or 0,
+            "reasoning_tokens": getattr(out_details, "reasoning_tokens", 0) or 0,
         }
         self.total_input_tokens += usage["input_tokens"]
         self.total_output_tokens += usage["output_tokens"]
+        self.total_cached_input_tokens += usage["cached_input_tokens"]
+        self.total_reasoning_tokens += usage["reasoning_tokens"]
 
-        raw_text = "".join(
-            block.text for block in response.content if getattr(block, "type", "") == "text"
-        )
-        if response.stop_reason == "max_tokens":
+        raw_text = response.output_text or ""
+
+        incomplete = getattr(response, "incomplete_details", None)
+        if getattr(incomplete, "reason", None) == "max_output_tokens":
             raise TruncatedResponseError(raw_text)
+        if not raw_text.strip():
+            refusal = _first_refusal(response)
+            raise EmptyResponseError(refusal or f"status={response.status!r}")
         return raw_text, usage
+
+
+def _first_refusal(response) -> Optional[str]:
+    """Surface a model refusal, which arrives instead of the JSON payload."""
+    for item in getattr(response, "output", None) or []:
+        for part in getattr(item, "content", None) or []:
+            if getattr(part, "type", "") == "refusal":
+                return getattr(part, "refusal", None)
+    return None
 
 
 def parse_llm_json(raw_text: str) -> PageExtractionContainer:
@@ -627,14 +729,29 @@ def run_extraction(args, base_dir: Path) -> None:
         logger.info("DRY RUN complete; no API calls made.")
         return
 
-    api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY")
+    api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        logger.error("No API key. Pass --api-key or set the ANTHROPIC_API_KEY "
+        logger.error("No API key. Pass --api-key or set the OPENAI_API_KEY "
                      "environment variable.")
         sys.exit(1)
 
     client = ExtractionClient(api_key=api_key, model=args.model,
-                              max_tokens=args.max_tokens)
+                              max_tokens=args.max_tokens,
+                              reasoning_effort=args.reasoning_effort)
+    try:
+        client.preflight()
+    except (AuthenticationError, PermissionDeniedError) as e:
+        logger.error("API key rejected (%s). Nothing was charged; fix the key and "
+                     "re-run.", type(e).__name__)
+        sys.exit(1)
+    except APIStatusError as e:
+        if e.status_code == 404:
+            logger.error("Model '%s' is not available to this API key. "
+                         "Pick another with --model.", args.model)
+            sys.exit(1)
+        raise
+    logger.info("Using model '%s' (reasoning effort: %s, max output tokens: %d).",
+                args.model, args.reasoning_effort or "off", args.max_tokens)
 
     n_ok, n_failed, n_scientists = 0, 0, 0
     t0 = time.time()
@@ -669,26 +786,27 @@ def run_extraction(args, base_dir: Path) -> None:
             n_ok += 1
             n_scientists += len(container.scientists)
             logger.info(
-                "[%d/%d] Page %d OK: %d scientists | tokens in=%d out=%d "
-                "(cumulative in=%d out=%d) | checkpoint written.",
+                "[%d/%d] Page %d OK: %d scientists | tokens in=%d (cached %d) "
+                "out=%d (reasoning %d) | cumulative in=%d out=%d | checkpoint written.",
                 i, len(remaining), page, len(container.scientists),
-                usage["input_tokens"], usage["output_tokens"],
+                usage["input_tokens"], usage["cached_input_tokens"],
+                usage["output_tokens"], usage["reasoning_tokens"],
                 client.total_input_tokens, client.total_output_tokens,
             )
 
         except TruncatedResponseError as e:
             n_failed += 1
             path = save_debug_artifact(debug_dir, page, e.raw_text, "truncated")
-            log_failed_page(failed_log_path, page, "output truncated at max_tokens")
+            log_failed_page(failed_log_path, page, "output truncated at max_output_tokens")
             append_checkpoint(checkpoint_path, {
                 "focus_page_number": page, "status": "failed",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "reason": "truncated",
             })
-            logger.error("Page %d FAILED: output truncated at max_tokens "
+            logger.error("Page %d FAILED: output truncated at max_output_tokens "
                          "(raw saved to %s). Consider raising --max-tokens.", page, path)
 
-        except (json.JSONDecodeError, ValidationError) as e:
+        except (json.JSONDecodeError, ValidationError, EmptyResponseError) as e:
             n_failed += 1
             path = save_debug_artifact(debug_dir, page, raw_text, "parse_error")
             log_failed_page(failed_log_path, page, f"parse/validation error: {e!r:.200}")
@@ -699,6 +817,14 @@ def run_extraction(args, base_dir: Path) -> None:
             })
             logger.error("Page %d FAILED: response did not match the schema "
                          "(%s). Raw output saved to %s.", page, type(e).__name__, path)
+
+        except (AuthenticationError, PermissionDeniedError) as e:
+            # Credentials died mid-run (revoked key, exhausted quota). Every
+            # remaining page would fail identically, so stop instead of looping.
+            log_failed_page(failed_log_path, page, f"auth_error: {e!r:.200}")
+            logger.error("Page %d FAILED: %s. Aborting the run -- the remaining "
+                         "pages would all fail the same way.", page, type(e).__name__)
+            break
 
         except (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError) as e:
             # All 5 retry attempts exhausted -- fail this window gracefully.
@@ -718,8 +844,10 @@ def run_extraction(args, base_dir: Path) -> None:
     logger.info("Extraction finished in %.1f min: %d pages OK, %d failed, "
                 "%d scientist profiles extracted.",
                 elapsed / 60, n_ok, n_failed, n_scientists)
-    logger.info("Total token consumption: input=%d, output=%d.",
-                client.total_input_tokens, client.total_output_tokens)
+    logger.info("Total token consumption: input=%d (cached %d), output=%d "
+                "(reasoning %d).",
+                client.total_input_tokens, client.total_cached_input_tokens,
+                client.total_output_tokens, client.total_reasoning_tokens)
     if n_failed:
         logger.warning("Failed pages are listed in '%s'. Re-run the same command "
                        "to retry them (successful pages are skipped automatically).",
@@ -1300,7 +1428,7 @@ def run_panel_transformation(base_dir: Path) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Extract 'American Men of Science' (1927) biographies into a "
-                    "long-format panel CSV via the Anthropic Claude vision API.",
+                    "long-format panel CSV via the OpenAI vision API.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--pdf", default=DEFAULT_PDF,
@@ -1312,13 +1440,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Process only the first two focus pages of the range "
                              "to verify the pipeline end-to-end.")
     parser.add_argument("--api-key", default=None,
-                        help="Anthropic API key (defaults to $ANTHROPIC_API_KEY).")
+                        help="OpenAI API key (defaults to $OPENAI_API_KEY).")
     parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="Anthropic model ID.")
+                        help="OpenAI model ID.")
+    parser.add_argument("--reasoning-effort", default=DEFAULT_REASONING_EFFORT,
+                        choices=["none", "low", "medium", "high", "xhigh", ""],
+                        help="Reasoning effort for GPT-5.x models. Reasoning tokens "
+                             "are billed as output; '' omits the parameter entirely "
+                             "for models that do not support it.")
     parser.add_argument("--dpi", type=int, default=DEFAULT_DPI,
                         help="Rendering resolution for page images.")
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
-                        help="Max output tokens per API call.")
+                        help="Max output tokens per API call (includes reasoning tokens).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Render sample page images without calling the API.")
     parser.add_argument("--panel-only", action="store_true",
