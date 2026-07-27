@@ -37,6 +37,31 @@ python extract_panel.py --panel-only
 python extract_panel.py --fresh --pages 14 1123
 ```
 
+### Batch API (half price — use this for real runs)
+
+`batch_extract.py` sends the same prompt, schema and model through OpenAI's
+Batch API, which costs **50% less** than live calls. The trade is latency:
+results are promised within 24 hours rather than arriving page by page. Submit
+and harvest are separate commands, so you can close the laptop in between.
+
+```powershell
+python batch_extract.py submit --pages 14 1123   # queues, returns immediately
+python batch_extract.py status                   # cheap progress check
+python batch_extract.py harvest --wait           # poll, then write the checkpoint
+python extract_panel.py --panel-only             # build the CSVs
+```
+
+Harvested pages land in `extraction_checkpoint.jsonl` in exactly the format live
+extraction writes, so the two modes are interchangeable and resumable against
+each other. `submit` skips pages already in the checkpoint. Batch IDs are kept
+in `batch_state.json`, which is what lets `harvest` run in a later session.
+
+Page images are large (~2 MB of base64 per request), so a full run exceeds the
+200 MB cap on a single batch input file; the requests are sharded automatically
+into as many batches as needed (about 13 for the full listing).
+
+At `--pages 14 1123` this is roughly **$97 instead of $194**.
+
 ## How it works
 
 - **Focus + Look-Ahead windows:** each API call sends images of page N (focus)
@@ -150,12 +175,13 @@ to `scientist_events_long.csv` for exact institution-string matches only.
 
 ## Model choice
 
-The default is **`gpt-5.6-terra`**, the closest OpenAI counterpart to the
-Sonnet-tier model this pipeline originally used — both on price
-($2.50 / $15 per M input/output vs Sonnet 5's $3 / $15) and on positioning
-(OpenAI describes Terra as "everyday production work at near-Sol quality").
-`gpt-5.6-luna` is the cheap tier worth testing if the budget tightens. Any
-vision-capable OpenAI model works via `--model`.
+The default is **`gpt-5.6-sol`** ($5 / $30 per M input/output). It was chosen
+over the cheaper `gpt-5.6-terra` on measured transcription accuracy, not on
+reputation — see the comparison below. `gpt-5.6-terra` ($2.50 / $15) is the
+closest counterpart to the Sonnet-tier model this pipeline originally used and
+remains a reasonable choice if budget is the binding constraint;
+`gpt-5.6-luna` is the cheap tier. Any vision-capable OpenAI model works via
+`--model`.
 
 Reasoning tokens are billed as output, so `--reasoning-effort` defaults to
 `low`. Raising it did **not** measurably improve boundary accuracy in testing
@@ -181,14 +207,13 @@ thirteen spellings correctly where Terra produced `Beare` for `Bear`/`Bearce`
 and `Bean` for `Beans`. Terra also has a systematic misread of this typeface,
 turning `Behre` into `Behro` on every attempt.
 
-Whether the extra ~$72 is worth it depends on the downstream use. Surnames are
-the linking key to other sources, so a misread is not a cosmetic problem — but
-`qa_check.py` catches most of them against the text layer either way.
+Sol costs ~$72 more over the full listing at list price, or ~$36 more through
+the Batch API. Surnames are the linking key to other sources, so a misread is
+not a cosmetic problem, and that margin buys back half of them.
 
 ## API budget estimate (full listing, pages 14–1123)
 
-Based on **10 measured pages** (75–84) with `gpt-5.6-terra` at 150 DPI,
-reasoning effort `low`:
+Measured on the hard-page sample at 150 DPI, reasoning effort `low`:
 
 | Metric | Value |
 | --- | --- |
@@ -196,17 +221,20 @@ reasoning effort `low`:
 | Avg input tokens / page | ~7,240 (~3,000 served from cache) |
 | Avg output tokens / page | ~5,500 (~1,000 of them reasoning) |
 | Scientists / page | ~12.3 |
-| Wall-clock / page | ~45 s |
+| Wall-clock / page (live calls) | ~45 s |
 
-| Pricing tier | Estimated total |
+| Model and tier | Estimated total |
 | --- | ---: |
-| **Standard** ($2.50 / $15 per M, incl. cached-input discount) | **~$104** |
-| Batch API (50% off) | ~$52 |
-| Recommended budget request (+10% buffer / retries) | **~$115** |
+| `gpt-5.6-sol`, **Batch API** (the default path) | **~$97** |
+| `gpt-5.6-sol`, live calls | ~$194 |
+| `gpt-5.6-terra`, Batch API | ~$60 |
+| `gpt-5.6-terra`, live calls | ~$120 |
+| Recommended budget request (Sol batch, +15% for retries) | **~$112** |
 
-At ~45 s per page a sequential full run takes roughly **14 hours**. Run it
-overnight, or use the Batch API, which halves the price at the cost of latency.
-The checkpoint makes the run fully resumable, so interrupting it is safe.
+Live calls take ~45 s per page, so a sequential full run is roughly **14 hours**.
+The Batch API halves the bill and needs no babysitting, at the cost of up to 24
+hours of latency. Either way the checkpoint makes the run fully resumable, so
+interrupting it is safe.
 
 Re-run cost check after more pages: token totals are logged per page in
 `pipeline.log` and stored in `extraction_checkpoint.jsonl` under `usage`.
@@ -306,7 +334,7 @@ other sources: the errors seen so far mangle the *end* of the name
 | --- | --- | --- |
 | `--pages START END` | 14 1123 | Inclusive 1-based PDF page range of focus pages |
 | `--test-run` | off | Restrict to the first 2 focus pages of the range |
-| `--model` | `gpt-5.6-terra` | OpenAI model ID |
+| `--model` | `gpt-5.6-sol` | OpenAI model ID |
 | `--reasoning-effort` | `low` | `none`/`low`/`medium`/`high`/`xhigh`; billed as output tokens |
 | `--dpi` | 150 | Page image resolution |
 | `--max-tokens` | 32000 | Output token cap per call (raise if pages truncate) |

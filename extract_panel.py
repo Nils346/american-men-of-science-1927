@@ -75,7 +75,29 @@ from profile_merge import merge_page_attempts
 # ---------------------------------------------------------------------------
 
 DEFAULT_PDF = "American Men of Science_4th edition_1927.pdf"
-DEFAULT_MODEL = "gpt-5.6-terra"   # Sonnet-tier peer on both quality and price
+DEFAULT_MODEL = "gpt-5.6-sol"   # fewer surname misreads than terra; see README
+
+# USD per 1M tokens: (fresh input, cached input, output). Batch API halves all
+# three. Used only for reporting what a run cost.
+PRICING = {
+    "gpt-5.6-sol": (5.00, 0.50, 30.00),
+    "gpt-5.6-terra": (2.50, 0.25, 15.00),
+    "gpt-5.6-luna": (0.50, 0.05, 3.00),
+}
+BATCH_DISCOUNT = 0.5
+
+
+def usd_cost(model: str, usage: dict, batch: bool = False) -> float:
+    """Price one call's token usage; 0.0 for a model we have no rate card for."""
+    if model not in PRICING:
+        return 0.0
+    fresh_in, cached_in, out = PRICING[model]
+    cached = usage.get("cached_input_tokens", 0)
+    total = ((usage.get("input_tokens", 0) - cached) * fresh_in
+             + cached * cached_in
+             + usage.get("output_tokens", 0) * out) / 1e6
+    return total * (BATCH_DISCOUNT if batch else 1.0)
+
 DEFAULT_DPI = 150            # ~1100 x 1580 px per page: near the 1568px optimal long edge
 DEFAULT_MAX_TOKENS = 32000   # dense pages can hold 25+ profiles
 DEFAULT_REASONING_EFFORT = "low"  # transcription work: keep billed reasoning tokens down
@@ -598,7 +620,12 @@ class ExtractionClient:
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
-    def _call(self, content: list):
+    def request_body(self, content: list) -> dict:
+        """The Responses payload for one page window.
+
+        Shared with the Batch API path, which submits exactly this body as the
+        `body` of a batch request line, so the two run modes cannot drift apart.
+        """
         kwargs = dict(
             model=self.model,
             # The long system prompt is identical on every call, so it lands in
@@ -611,6 +638,10 @@ class ExtractionClient:
         )
         if self._reasoning_supported:
             kwargs["reasoning"] = {"effort": self.reasoning_effort}
+        return kwargs
+
+    def _call(self, content: list):
+        kwargs = self.request_body(content)
         try:
             return self.client.responses.create(**kwargs)
         except BadRequestError as e:
