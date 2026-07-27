@@ -154,13 +154,36 @@ The default is **`gpt-5.6-terra`**, the closest OpenAI counterpart to the
 Sonnet-tier model this pipeline originally used — both on price
 ($2.50 / $15 per M input/output vs Sonnet 5's $3 / $15) and on positioning
 (OpenAI describes Terra as "everyday production work at near-Sol quality").
-`gpt-5.6-sol` doubles the input price for frontier reasoning that transcription
-does not need; `gpt-5.6-luna` is the cheap tier worth testing if the budget
-tightens. Any vision-capable OpenAI model works via `--model`.
+`gpt-5.6-luna` is the cheap tier worth testing if the budget tightens. Any
+vision-capable OpenAI model works via `--model`.
 
 Reasoning tokens are billed as output, so `--reasoning-effort` defaults to
 `low`. Raising it did **not** measurably improve boundary accuracy in testing
 (see below) but did roughly double the output tokens.
+
+### Terra vs Sol, measured
+
+Ten calls across the three hardest pages (79, 82, 83 — the ones with the longest
+runs of repeated surnames), full-name roster prompt, effort `low`:
+
+| | `gpt-5.6-terra` | `gpt-5.6-sol` |
+| --- | --- | --- |
+| Entries returned (truth 68) | 66 | 65 |
+| Surnames misread | 19 | 7 |
+| Runs with a phantom entry | 1 of 5 | 0 of 5 |
+| Cost per page | $0.108 | $0.175 |
+| Full run, 1110 pages | ~$120 | ~$194 |
+
+Both models now find the same number of entries; the roster fix, not the model,
+is what closed the counting gap. Sol's advantage is **transcription fidelity** —
+it misread less than half as many surnames, and on page 79 it returned all
+thirteen spellings correctly where Terra produced `Beare` for `Bear`/`Bearce`
+and `Bean` for `Beans`. Terra also has a systematic misread of this typeface,
+turning `Behre` into `Behro` on every attempt.
+
+Whether the extra ~$72 is worth it depends on the downstream use. Surnames are
+the linking key to other sources, so a misread is not a cosmetic problem — but
+`qa_check.py` catches most of them against the text layer either way.
 
 ## API budget estimate (full listing, pages 14–1123)
 
@@ -237,20 +260,35 @@ surnames**. A page printing Beckwith five times, Behre three times or Bean four
 times is where entries go missing — the model collapses the run and loses count.
 Pages of distinct surnames extract cleanly.
 
-**Multi-pass merge (on by default).** After each page the text layer is consulted
-for free; if it says the pass came up short, the page is extracted again and the
-passes are merged as a *union* (`--max-passes`, default 2, `--no-verify` to turn
-off). Because the drops are near-random, two passes rarely lose the same
-scientist. The merge also repairs spellings: where two passes disagree, the one
-the text layer confirms wins, so `Boer` becomes `Beer`.
+**Fix: roster by full name before transcribing.** The model now has to list the
+*complete bold heading* of every entry beginning on the page —
+`Behre, Dr. J(eanette) A(llen)` — into `entries_beginning_on_focus_page` before
+it writes any detail, and the schema declares that field ahead of `scientists`
+so it is generated first. The full heading is the unit of identity, never the
+surname: within a page every heading is distinct, so there is no run of
+identical tokens for the model to lose count of. An earlier version of this idea
+rostered *surnames*, which reproduced the bug inside the roster itself
+(`Behre, Behre` for three Behres) and then faithfully propagated the undercount.
 
-This helps but does not solve the problem, and it introduces a failure of its
-own. On the 10-page sample it recovered several genuinely missed entries, yet
-against the four pages verified by hand it scored no better overall: it fixed
-page 83 (12 → 13, correct) but left page 80 one *over* (a mangled entry that no
-longer matches its twin) and page 84 one *under* (both passes missed the same
-top-of-page entry). Union merging trades omissions for occasional duplicates,
-so `qa_check.py` remains mandatory rather than optional.
+The collapse is essentially gone. Page 83 (13 entries, `Behre` ×3, `Beeson` ×2)
+had been returning 11–12 and now returns 13. The `Beckwith` ×5 and `Beebe` ×4
+runs on page 82 come through complete. What remains is an occasional single
+dropped entry, no longer tied to repeat runs.
+
+**Multi-pass merge (off by default).** With `--max-passes` above 1 the text
+layer is consulted after each page, and if it says the pass came up short the
+page is extracted again and the passes are merged as a *union*. Because the
+drops are near-random, two passes rarely lose the same scientist, and the merge
+also repairs spellings: where two passes disagree, the one the text layer
+confirms wins, so `Boer` becomes `Beer`.
+
+It is off by default because it trades one error for another. On the four
+hand-verified pages it scored no better overall: it fixed page 83 (12 → 13,
+correct) but left page 80 one *over* — a mangled entry that no longer matched
+its twin and so survived the union as a second copy of a real scientist. A
+phantom scientist is worse than a missing one, since it silently enters the
+panel as a real observation. Turn it on only if you would rather over-collect
+and filter by hand.
 
 Alphabetical ordering alone does **not** catch this. Ordering detects overlaps
 and duplicates, but a gap in the alphabet is indistinguishable from two
@@ -272,6 +310,6 @@ other sources: the errors seen so far mangle the *end* of the name
 | `--reasoning-effort` | `low` | `none`/`low`/`medium`/`high`/`xhigh`; billed as output tokens |
 | `--dpi` | 150 | Page image resolution |
 | `--max-tokens` | 32000 | Output token cap per call (raise if pages truncate) |
-| `--max-passes` | 2 | Extra passes for pages the text layer says came up short |
+| `--max-passes` | 1 | Above 1, re-extracts pages the text layer says came up short and unions the passes (can duplicate; see below) |
 | `--no-verify` | off | Skip the free omission check (one pass per page) |
 | `--api-key` | `$OPENAI_API_KEY` | OpenAI API key |

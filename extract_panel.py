@@ -79,7 +79,10 @@ DEFAULT_MODEL = "gpt-5.6-terra"   # Sonnet-tier peer on both quality and price
 DEFAULT_DPI = 150            # ~1100 x 1580 px per page: near the 1568px optimal long edge
 DEFAULT_MAX_TOKENS = 32000   # dense pages can hold 25+ profiles
 DEFAULT_REASONING_EFFORT = "low"  # transcription work: keep billed reasoning tokens down
-DEFAULT_MAX_PASSES = 2       # a 2nd pass runs only when a page looks short
+# One pass by default. A second pass recovers some dropped entries but the union
+# of two disagreeing passes can also invent one, and a phantom scientist is worse
+# than a missing one. Opt in with --max-passes 2 if you want the trade.
+DEFAULT_MAX_PASSES = 1
 DEFAULT_START_PAGE = 14      # 1-based PDF page where the scientist listing begins
 DEFAULT_END_PAGE = 1123      # 1-based PDF page where the listing ends
 DIRECTORY_YEAR = 1927        # edition year: current (italic) positions run up to here
@@ -206,6 +209,9 @@ class ScientistProfile(BaseModel):
 class PageExtractionContainer(BaseModel):
     """Top-level object the LLM must return for every focus page."""
     focus_page_number: int
+    # Full bold headings, rostered before transcription so a run of same-surname
+    # entries cannot be silently collapsed. Kept for the length cross-check.
+    entries_beginning_on_focus_page: List[str] = Field(default_factory=list)
     scientists: List[ScientistProfile] = Field(default_factory=list)
 
 
@@ -243,6 +249,28 @@ fences, no commentary.
 You receive images of TWO consecutive PDF pages:
 - Image 1 = the FOCUS PAGE.
 - Image 2 = the LOOK-AHEAD PAGE (the very next page; may be absent for the last page).
+
+# AN ENTRY IS IDENTIFIED BY ITS FULL BOLD HEADING, NEVER BY THE SURNAME ALONE
+Each entry opens with a bold heading giving the surname AND the given names,
+e.g. "Behre, Dr. J(eanette) A(llen)". That whole string is the entry's identity.
+The surname on its own is NOT an identity, because consecutive entries very
+often share one: this volume prints three separate scientists named Behre on a
+single page, two named Beeson, four named Bell, five named Beckwith. They are
+different people with different headings, and each one is its own entry.
+Whenever you see a run of entries sharing a surname, slow down and treat each
+bold heading as a separate item. Collapsing such a run is the single most
+common way this task is got wrong.
+
+# WORK IN TWO STEPS
+STEP 1 -- ROSTER. Before transcribing any details, read the focus page in column
+order (the entire left column top to bottom, then the entire right column) and
+write the COMPLETE bold heading of every entry that BEGINS on the focus page
+into "entries_beginning_on_focus_page", in printed order, copied as printed
+(honorifics and parenthesised name parts included). Every heading on a page is
+distinct, so use that as your own check: if two roster items come out identical
+you have merged two scientists and must separate them.
+STEP 2 -- TRANSCRIBE. Emit exactly one object in "scientists" for each roster
+item, in the same order. The two arrays MUST have the same length.
 
 # EXTRACTION BOUNDARY RULE (critical -- prevents duplicates and data loss)
 - Extract ONLY the scientists whose entries BEGIN on the FOCUS PAGE. An entry
@@ -366,6 +394,7 @@ You receive images of TWO consecutive PDF pages:
 Return exactly one JSON object matching this schema (no extra keys, no markdown):
 {
   "focus_page_number": <int, the PDF page number given in the user message>,
+  "entries_beginning_on_focus_page": ["Behre, Dr. J(eanette) A(llen)", ...],
   "scientists": [
     {
       "full_name": "...", "titles": "..." | null, "mailing_address": "...",
@@ -385,8 +414,9 @@ Return exactly one JSON object matching this schema (no extra keys, no markdown)
     }
   ]
 }
+The roster and "scientists" must line up one-for-one and in the same order.
 If NO new entry begins on the focus page (e.g. a blank or front-matter page),
-return {"focus_page_number": <int>, "scientists": []}.
+return empty arrays for both.
 """
 
 
@@ -484,8 +514,12 @@ _SCIENTIST_SCHEMA = _obj({
     "research_in_progress": _nullable("string"),
 })
 
+# The roster is declared before "scientists" on purpose: Structured Outputs
+# generates keys in schema order, so the model commits to a complete list of
+# distinct bold headings before it starts producing long per-entry detail.
 PAGE_EXTRACTION_SCHEMA = _obj({
     "focus_page_number": {"type": "integer"},
+    "entries_beginning_on_focus_page": {"type": "array", "items": {"type": "string"}},
     "scientists": {"type": "array", "items": _SCIENTIST_SCHEMA},
 })
 
@@ -819,11 +853,18 @@ def run_extraction(args, base_dir: Path) -> None:
                 container.focus_page_number = page   # trust our loop, not the model
                 profiles = [s.model_dump() for s in container.scientists]
 
+                roster = container.entries_beginning_on_focus_page
+                if roster and len(roster) != len(profiles):
+                    logger.warning(
+                        "Page %d: model rostered %d headings but transcribed %d "
+                        "entries.", page, len(roster), len(profiles))
+
                 record = {
                     "focus_page_number": page,
                     "status": "ok",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "n_scientists": len(profiles),
+                    "n_rostered": len(roster),
                     "pass": attempt,
                     "usage": usage,
                     "scientists": profiles,
@@ -1547,9 +1588,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "are billed as output; '' omits the parameter entirely "
                              "for models that do not support it.")
     parser.add_argument("--max-passes", type=int, default=DEFAULT_MAX_PASSES,
-                        help="Maximum extraction passes per page. A second pass runs "
-                             "only when the PDF's text layer says the first one "
-                             "missed an entry; results are merged as a union.")
+                        help="Maximum extraction passes per page (default 1). Above 1, "
+                             "an extra pass runs when the PDF's text layer says the "
+                             "previous one missed an entry and the passes are unioned. "
+                             "That recovers omissions but can also introduce a "
+                             "duplicate, so it is off by default.")
     parser.add_argument("--no-verify", action="store_true",
                         help="Skip the free text-layer omission check (implies a "
                              "single pass per page).")
