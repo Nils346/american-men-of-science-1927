@@ -5,6 +5,7 @@
 extraction_checkpoint*.jsonl
 batch_state.json
 batch_input/
+batch_harvest.log
 failed_pages.log
 pipeline.log
 rerun.log
