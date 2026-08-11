@@ -366,7 +366,10 @@ item, in the same order. The two arrays MUST have the same length.
      M.S, Ph.D, Sc.D, M.D, LL.B, C.E, D.Sc, optionally prefixed "hon." for
      honorary; medical licences like L.R.C.P count too, with institution null
      when none is named). A degree is conferred in a single year: year = that
-     year, end_year = null.
+     year, end_year = null. Several degree abbreviations can precede ONE
+     institution and year ("A.B, M.E, Va. Polytech, 86."): each was taken at
+     that institution in that year -- emit one record per degree, all carrying
+     the shared institution and year.
    - STUDY WITHOUT A DEGREE: institutions listed with years (or none) but NO
      degree letters -- "Illinois, 88-90;", "Cornell, 75.", "Berlin, 05, 07-08;",
      "Polytech, Berlin, 94; London; Paris.", "U. S. Mil. Acad." These are real
@@ -1371,6 +1374,12 @@ def load_profiles_from_checkpoint(checkpoint_path: Path,
             logger.info("Page %d: merged %d passes -> %d unique scientists "
                         "(largest single pass had %d).",
                         page, len(passes), len(merged), max(len(p) for p in passes))
+        if doc is not None:
+            # Strip birth data the page's own text cannot back up (the model
+            # occasionally invents it); subtractive only, see qa_check.
+            for who, what in qa_check.repair_birth_fields(
+                    merged, qa_check.squashed_text(doc, page)):
+                logger.info("Page %d: %s -- %s", page, who, what)
         for s in merged:
             s["_source_page"] = page
             profiles.append(s)

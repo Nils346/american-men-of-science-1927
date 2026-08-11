@@ -221,7 +221,17 @@ def write_workbook(profiles: list[dict], base_dir: Path,
     qa.freeze_panes = "A2"
     qa.auto_filter.ref = "A1:E%d" % max(2, r - 1)
 
-    wb.save(out_path)
+    try:
+        wb.save(out_path)
+    except PermissionError:
+        # The reviewer has the workbook open in Excel; don't crash the whole
+        # pipeline over it -- park the fresh copy next to it instead.
+        fallback = out_path.with_name(out_path.stem + "_new" + out_path.suffix)
+        wb.save(fallback)
+        print("NOTE: %s is open in Excel -- fresh copy saved as %s. Close "
+              "Excel and rerun 'python review_workbook.py' to replace it."
+              % (out_path.name, fallback.name))
+        return fallback
     return out_path
 
 

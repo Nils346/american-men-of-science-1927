@@ -304,7 +304,8 @@ def check_stars(page: int, profiles: list[dict], text: str,
                                      if p.get("star_status")) or "none")))
 
 
-_BIRTH_DATE_RE = re.compile(r"^([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})$")
+# Tolerates abbreviated months: "March 1, 1889" as well as "Oct. 26, 1854".
+_BIRTH_DATE_RE = re.compile(r"^([A-Za-z]+)\.?\s+(\d{1,2}),\s*(\d{4})$")
 
 
 def check_birth_dates(page: int, profiles: list[dict], text: str,
@@ -321,14 +322,110 @@ def check_birth_dates(page: int, profiles: list[dict], text: str,
         m = _BIRTH_DATE_RE.match((p.get("birth_date") or "").strip())
         if not m:
             continue
-        month, day = m.group(1), int(m.group(2))
+        month, day, year = m.group(1), int(m.group(2)), m.group(3)
         probe = re.compile(re.escape(month[:3]) + r"[a-z]*\.?" + str(day) + ",", re.I)
         if not probe.search(text):
-            out.append(Finding(ERROR, "birth_date_not_on_page", page,
-                               p.get("full_name") or "",
-                               "extracted birth date %r does not appear on the "
-                               "page -- possibly invented (some entries print no "
-                               "birth data at all)" % p["birth_date"]))
+            # A printed date with the same day+year but a different month word
+            # is a dispute between the OCR and the model over the MONTH (the
+            # OCR has been caught misreading it), not an invention.
+            day_trace = re.search(r"([A-Za-z]{3,9})\.?%d,(?:%s|%s)"
+                                  % (day, year[-2:], year), text)
+            if day_trace:
+                out.append(Finding(WARN, "birth_month_ocr_mismatch", page,
+                                   p.get("full_name") or "",
+                                   "extracted %r but the OCR text layer reads "
+                                   "%r -- verify the month on the page image"
+                                   % (p["birth_date"], day_trace.group(0))))
+            else:
+                out.append(Finding(ERROR, "birth_date_not_on_page", page,
+                                   p.get("full_name") or "",
+                                   "extracted birth date %r does not appear on "
+                                   "the page -- possibly invented (some entries "
+                                   "print no birth data at all)" % p["birth_date"]))
+
+
+def _entry_slice(squashed: str, full_name: str) -> Optional[str]:
+    """The squashed text of THIS entry (approximately), located by its heading.
+
+    Distinguishes between same-surname neighbours (six Beals on one page) by
+    requiring the first-name chunk right after the surname, tolerating an
+    honorific ("Dr.", "Prof.") in between. Returns None when the heading cannot
+    be pinned down (OCR garble) -- callers must then leave the profile alone.
+    """
+    name = re.sub(r"\s+", "", full_name or "")
+    surname, _, rest = name.partition(",")
+    if not surname or not rest:
+        return None
+    m = re.match(r"[^(),]*\([^)]*\)", rest)          # "J(esse)" / "CarlH(ugh)"
+    probe = (m.group(0) if m else rest.split(",")[0])[:14]
+    if not probe:
+        return None
+    # The OCR loves dropping a parenthesis ("Bates, Harry )Clifford" for
+    # "Bates, H(arry) Clifford"), so fall back to a paren-stripped comparison.
+    probe_flat = probe.replace("(", "").replace(")", "")
+    for hit in re.finditer(re.escape(surname) + ",", squashed):
+        window = squashed[hit.end():hit.end() + 14 + len(probe)]
+        if probe in window or probe_flat in window.replace("(", "").replace(")", ""):
+            return squashed[hit.start():hit.start() + 320]
+    return None
+
+
+def repair_birth_fields(profiles: list[dict], squashed: str) -> list[tuple[str, str]]:
+    """Null birth data that the entry's own printed text cannot back up.
+
+    Prompt rules alone do not reliably stop the model from inventing birth
+    data where the page prints none (it has filled in birthdays from its
+    background knowledge of famous scientists, and recycled degree years).
+    This repair is strictly subtractive -- it only REMOVES unverifiable
+    values, never writes new ones -- and it is deliberately conservative:
+    - a date whose day+year (or month+year) trace IS printed is kept even if
+      the OCR disputes part of it (the OCR misreads months; the QA check
+      flags the dispute for eyeball review instead);
+    - when the entry cannot be located in the text layer, nothing is touched.
+    Returns (scientist, description) notes for every repair made.
+    """
+    notes: list[tuple[str, str]] = []
+    for p in profiles:
+        name = p.get("full_name") or ""
+
+        # Degree text inside the birthplace means the whole birth block was
+        # invented from the degree chain ("A.B. Stanford" as a birthplace).
+        if p.get("birth_place") and _DEGREE_TOKEN_RE.search(p["birth_place"]):
+            was = p["birth_place"]
+            for f in ("birth_place", "birth_city", "birth_state",
+                      "birth_country", "birth_date", "birth_year"):
+                p[f] = None
+            notes.append((name, "all birth fields cleared: birth_place %r "
+                                "was degree text" % was))
+            continue
+
+        seg = _entry_slice(squashed, name)
+        if seg is None:
+            continue
+        yy = str(p["birth_year"])[-2:] if p.get("birth_year") else None
+
+        m = _BIRTH_DATE_RE.match((p.get("birth_date") or "").strip())
+        if m:
+            month, day, year = m.group(1), m.group(2), m.group(3)
+            printed = (
+                # same day+year under any month word (month may be misOCRed) ..
+                re.search(r"[A-Za-z]{3,9}\.?%s,(?:%s|%s)" % (day, year[-2:], year), seg)
+                # .. or same month+year under any day (day may be misOCRed).
+                or re.search(re.escape(month[:3]) + r"[a-z]*\.?\d{1,2},(?:%s|%s)"
+                             % (year[-2:], year), seg, re.I))
+            if printed:
+                continue
+            p["birth_date"] = None
+            what = "birth_date %r stripped (no printed trace)" % (month + " " + day + ", " + year)
+            if p.get("birth_year") and yy and not re.search(",%s[.,;]" % yy, seg):
+                p["birth_year"] = None
+                what += "; birth_year stripped too"
+            notes.append((name, what))
+        elif p.get("birth_year") and yy and not re.search(",%s[.,;]" % yy, seg):
+            was_year = p["birth_year"]
+            p["birth_year"] = None
+            notes.append((name, "birth_year %s stripped (no printed trace)" % was_year))
+    return notes
 
 
 def check_ordering(pages: dict[int, list[dict]], out: list[Finding]) -> None:
@@ -440,6 +537,14 @@ def check_profile(page: int, p: dict, out: list[Finding]) -> None:
             out.append(Finding(ERROR, "position_in_education", page, name,
                                "degree_type=%r looks like a job title"
                                % d.get("degree_type")))
+        # A dangling degree ("A.B, M.E, Va. Polytech, 86" where the shared
+        # institution/year did not get copied onto the first abbreviation).
+        if d.get("degree_type") and not d.get("institution") and not y:
+            out.append(Finding(WARN, "degree_missing_institution_and_year",
+                               page, name,
+                               "degree %r has neither institution nor year -- "
+                               "it may share its neighbour's printed ones"
+                               % d["degree_type"]))
 
     n_current = 0
     for e in p.get("employment") or []:
@@ -557,6 +662,12 @@ def main() -> None:
     findings: list[Finding] = []
 
     if doc is not None:
+        # Repair BEFORE checking, so the checks (and the report) describe the
+        # data the panel will actually be built from. Every repair is surfaced
+        # as a warning so the reviewer still sees the row.
+        for page in sorted(pages):
+            for who, what in repair_birth_fields(pages[page], squashed_text(doc, page)):
+                findings.append(Finding(WARN, "birth_field_repaired", page, who, what))
         for page in sorted(pages):
             check_against_text_layer(page, pages[page], squashed_text(doc, page),
                                      alphabetical_window(pages, page), findings)
