@@ -64,39 +64,45 @@ def _page_of(p: dict):
     return p.get("_source_page") or p.get("source_pdf_page")
 
 
-def _year(y) -> str:
-    return str(y) if y else "?"
+def _span(start, end, current: bool = False) -> str:
+    """Year span exactly as the directory means it.
+
+    "1921-1923" closed range | "1921-" still held in 1927 | "1921" that year
+    only | "undated". A lone "?" is never shown: it used to suggest an unknown
+    end date where the book actually means a single-year stay.
+    """
+    if start and end:
+        return str(start) if start == end else "%d-%d" % (start, end)
+    if start:
+        return "%d-" % start if current else str(start)
+    if end:
+        return str(end)
+    return "undated"
 
 
 def _degrees(p: dict) -> str:
     lines = []
     for d in p.get("education") or []:
+        kind = d.get("degree_type") or "study"
         inst = d.get("institution") or "?"
-        lines.append("%s, %s, %s" % (d.get("degree_type") or "?", inst, _year(d.get("year"))))
+        lines.append("%s, %s, %s" % (kind, inst, _span(d.get("year"), d.get("end_year"))))
     return "\n".join(lines)
+
+
+def _position_line(e: dict) -> str:
+    org = (", " + e["institution_org"]) if e.get("institution_org") else ""
+    cur = bool(e.get("is_current_position"))
+    span = _span(e.get("start_year"), e.get("end_year"), cur)
+    mark = "  [current 1927]" if cur else ""
+    return "%s%s, %s%s" % (e.get("position_title") or "?", org, span, mark)
 
 
 def _career(p: dict) -> str:
-    lines = []
-    for e in p.get("employment") or []:
-        span = "%s-%s" % (_year(e.get("start_year")),
-                          "" if e.get("is_current_position") and not e.get("end_year")
-                          else _year(e.get("end_year")))
-        org = (", " + e["institution_org"]) if e.get("institution_org") else ""
-        cur = "  [current 1927]" if e.get("is_current_position") else ""
-        lines.append("%s%s, %s%s" % (e.get("position_title") or "?", org, span, cur))
-    return "\n".join(lines)
+    return "\n".join(_position_line(e) for e in p.get("employment") or [])
 
 
 def _minor(p: dict) -> str:
-    lines = []
-    for e in p.get("minor_positions") or []:
-        org = (", " + e["institution_org"]) if e.get("institution_org") else ""
-        span = ""
-        if e.get("start_year") or e.get("end_year"):
-            span = ", %s-%s" % (_year(e.get("start_year")), _year(e.get("end_year")))
-        lines.append("%s%s%s" % (e.get("position_title") or "?", org, span))
-    return "\n".join(lines)
+    return "\n".join(_position_line(e) for e in p.get("minor_positions") or [])
 
 
 def _load_findings(path: Path) -> dict[tuple[int, str], list[str]]:

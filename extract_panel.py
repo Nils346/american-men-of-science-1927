@@ -125,12 +125,18 @@ logger = logging.getLogger("extract_panel")
 # ---------------------------------------------------------------------------
 
 class DegreeRecord(BaseModel):
-    """One earned degree, in chronological order of appearance in the entry."""
-    degree_type: str
+    """One education record, in order of appearance in the entry.
+
+    degree_type is null for degreeless study spells ("Illinois, 88-90"), which
+    the directory lists in the same slot; end_year captures the range of such a
+    spell (a conferred degree has a single year).
+    """
+    degree_type: Optional[str] = None
     institution: Optional[str] = None
     year: Optional[int] = None
+    end_year: Optional[int] = None
 
-    @field_validator("year", mode="before")
+    @field_validator("year", "end_year", mode="before")
     @classmethod
     def _coerce_year(cls, v):
         return _coerce_optional_int(v)
@@ -157,6 +163,7 @@ class MinorPositionRecord(BaseModel):
     institution_org: Optional[str] = None
     start_year: Optional[int] = None
     end_year: Optional[int] = None
+    is_current_position: bool = False
 
     @field_validator("start_year", "end_year", mode="before")
     @classmethod
@@ -323,8 +330,10 @@ item, in the same order. The two arrays MUST have the same length.
      Canadian provinces (Que, Ont, B.C, etc.), or the actual country for foreign
      addresses ("Peru", "England"). Default to "USA" when a US state is present.
 4. star_status: true ONLY if an asterisk (*) is printed directly BEFORE the
-   italicized department of investigation. Otherwise false. Stars mark the top
-   1,000 scientists; the vast majority of entries have NO star.
+   italicized department of investigation ("* Optics.", "*Botany."). Otherwise
+   false. Stars mark the top 1,000 scientists; the vast majority of entries have
+   NO star. Decide from THIS entry's pixels only: a speck or stain is not a
+   star, and if you are not certain the mark is an asterisk, return false.
 5. department: the scientific field printed in italics right after the address
    (e.g. "Zoology.", "Physiological chemistry."). Strip the trailing period.
 6. Birth data: place then date, e.g. "Antrim, N. H, March 1, 89." ->
@@ -341,6 +350,8 @@ item, in the same order. The two arrays MUST have the same length.
                    printed; null if only a year is given),
    birth_year    = 1889 (expand 2-digit years: these scientists were born in the
                    19th or very early 20th century).
+   The date is sometimes a bare year ("Cincinnati, Ohio, 91.") -- that IS the
+   birth year: birth_year = 1891, birth_date = null.
    Some entries print NO birth information at all: the italic department is
    followed directly by the degrees ("... Los Angeles, Calif. Geology. A.B,
    Stanford, 12, A.M, 15 ..."). Then EVERY birth field is null. Others print a
@@ -349,16 +360,33 @@ item, in the same order. The two arrays MUST have the same length.
    birth date or year from a degree year, and NEVER supply facts from your own
    knowledge of the person -- even when you recognise the scientist, this
    dataset may contain only what THIS page prints.
-7. education: earned or honorary DEGREES only, in chronological order, e.g.
-   "A.B, Brown, 13, A.M, 14, Ph.D, 18." A degree_type is a letter abbreviation
-   such as A.B, B.S, A.M, M.S, Ph.D, Sc.D, M.D, LL.B, C.E, D.Sc (optionally
-   prefixed "hon." for honorary). NEVER put an employment position (Instr., prof,
-   asst, biol, etc.) or its institution in education -- those belong only in
-   employment. The words 'college'/'university' are omitted in print; keep
-   institution names as printed. When consecutive degrees omit the institution,
-   it is the SAME institution as the previous degree -- fill it in. Expand 2-digit
-   years to 4 digits using the birth year as anchor (a degree year must be
-   >= birth_year + ~15 and <= 1927).
+7. education: everything the entry lists between the birth data and the career
+   chain, in printed order. TWO kinds of record share this array:
+   - DEGREES: degree_type is the letter abbreviation as printed (A.B, B.S, A.M,
+     M.S, Ph.D, Sc.D, M.D, LL.B, C.E, D.Sc, optionally prefixed "hon." for
+     honorary; medical licences like L.R.C.P count too, with institution null
+     when none is named). A degree is conferred in a single year: year = that
+     year, end_year = null.
+   - STUDY WITHOUT A DEGREE: institutions listed with years (or none) but NO
+     degree letters -- "Illinois, 88-90;", "Cornell, 75.", "Berlin, 05, 07-08;",
+     "Polytech, Berlin, 94; London; Paris.", "U. S. Mil. Acad." These are real
+     education records: degree_type = null, institution as printed, year = the
+     first year, end_year = the last year of a range (null for a single year or
+     when undated). NEVER convert a study spell into a degree -- do not copy the
+     previous degree letters onto it and do not invent a "B.S". Entries mix both
+     kinds: "M.D, Columbia, 02; Berlin, 05, 07-08" is one M.D degree plus one
+     degreeless stay in Berlin.
+   A "fellow, 93-94" link inside the education chain is a fellowship, NOT a
+   degree: record it under minor_positions (at the institution under discussion)
+   and continue the degree chain after it -- in "B.S, Chicago, 06, fellow, 06,
+   Ph.D, 09", the Ph.D is still Chicago, 1909.
+   NEVER put an employment position (Instr., prof, asst, biol, etc.) or its
+   institution in education -- those belong only in employment. The words
+   'college'/'university' are omitted in print; keep institution names as
+   printed. When consecutive degrees omit the institution, it is the SAME
+   institution as the previous degree -- fill it in. Expand 2-digit years to 4
+   digits using the scientist's chronology (a degree year must be
+   >= birth_year + ~15 when a birth year is printed, and <= 1927).
 8. employment: the MAIN CAREER CHAIN. This is the single semicolon-separated
    sequence of positions that runs from the earliest job up to and INCLUDING the
    italicized current 1927 position, e.g.:
@@ -383,12 +411,24 @@ item, in the same order. The two arrays MUST have the same length.
    subject changes to biology). But when a link states its OWN rank ("asst",
    "assoc", "prof", "dir", "lecturer"), use that rank as printed and do NOT carry
    the old one. Never invent a rank that is not implied by the chain.
-   Parse date ranges into start_year / end_year (expand 2-digit years; "19-" or a
-   single year with no end often means ongoing -- leave end_year null if
-   open-ended). The position printed in ITALICS is the scientist's CURRENT 1927
-   position: set is_current_position = true for that record only (usually the last
-   link; at most one or two records). NEVER place research subjects, societies, or
-   honors in employment.
+   DATE SEMANTICS (identical for employment and minor_positions; expand 2-digit
+   years):
+   - "21-23"  -> start_year 1921, end_year 1923.
+   - "21-" (trailing dash) -> the role is STILL HELD in 1927: start_year 1921,
+     end_year null, is_current_position true -- trailing-dash roles are current
+     even when not printed in italics.
+   - a single year "21" -> a stay within that one year: start_year = end_year =
+     1921, is_current_position false.
+   - an ITALIC role with no date at all -> start_year and end_year null,
+     is_current_position true. NEVER guess a start year that is not printed.
+   The italic position is always current, and a scientist frequently holds
+   SEVERAL positions at once ("asst. prof, Stanford, 02- ; consulting engineer,
+   07- ; chief engineer, Calif. Gas and Elec. Corp, 04-" is three concurrent
+   roles, ALL current): flag every open or italic role, not just the last one.
+   When one date span covers an "and" group ("geologist, Midwest Ref. Co, and
+   chief geologist, Midwest Explor. Co, 21-"), emit one record per role, each
+   carrying the shared dates and current flag. NEVER place research subjects,
+   societies, or honors in employment.
 9. minor_positions: appointments that are NOT part of the main career chain --
    they typically appear AFTER the italic current position, or are clearly of a
    different kind: military service (e.g. "Second lieut, Sanit. C, 18"),
@@ -396,8 +436,10 @@ item, in the same order. The two arrays MUST have the same length.
    committee or editorial roles, delegate/officer roles. Test: if removing it does
    NOT break the chronological chain of primary jobs, it is a minor position.
    Return each as an OBJECT with position_title, institution_org (null if none),
-   start_year, end_year (expand 2-digit years; leave end_year null if a single
-   year or open-ended). Empty array if none.
+   start_year, end_year, is_current_position -- dated by the SAME date semantics
+   as employment: "Summers, Bologna, 12" is start_year = end_year = 1912;
+   "Asst. visiting physician, Presb. Hosp, 19-" is ongoing (end_year null,
+   is_current_position true). Empty array if none.
 10. societies: memberships in scientific societies, kept as the printed
     abbreviations (e.g. "A.A.", "Soc. Mammal", "F.A.A."), one string per society.
     Empty array if none.
@@ -432,12 +474,14 @@ Return exactly one JSON object matching this schema (no extra keys, no markdown)
       "star_status": true|false, "department": "...",
       "birth_place": "..." | null, "birth_city": "..." | null, "birth_state": "..." | null,
       "birth_country": "..." | null, "birth_date": "..." | null, "birth_year": <int> | null,
-      "education": [{"degree_type": "...", "institution": "...", "year": <int>|null}],
+      "education": [{"degree_type": "..."|null, "institution": "..."|null,
+                     "year": <int>|null, "end_year": <int>|null}],
       "employment": [{"position_title": "...", "institution_org": "...",
                       "start_year": <int>|null, "end_year": <int>|null,
                       "is_current_position": true|false}],
       "minor_positions": [{"position_title": "...", "institution_org": "..."|null,
-                           "start_year": <int>|null, "end_year": <int>|null}],
+                           "start_year": <int>|null, "end_year": <int>|null,
+                           "is_current_position": true|false}],
       "societies": ["..."],
       "research_accomplished": "..." | null,
       "research_in_progress": "..." | null
@@ -525,9 +569,10 @@ def _obj(properties: dict) -> dict:
 
 
 _DEGREE_SCHEMA = _obj({
-    "degree_type": {"type": "string"},
+    "degree_type": _nullable("string"),    # null = study spell without a degree
     "institution": _nullable("string"),
     "year": _nullable("integer"),
+    "end_year": _nullable("integer"),      # study spells can span a range
 })
 
 _EMPLOYMENT_SCHEMA = _obj({
@@ -543,6 +588,7 @@ _MINOR_POSITION_SCHEMA = _obj({
     "institution_org": _nullable("string"),
     "start_year": _nullable("integer"),
     "end_year": _nullable("integer"),
+    "is_current_position": {"type": "boolean"},
 })
 
 _SCIENTIST_SCHEMA = _obj({
@@ -1162,6 +1208,8 @@ def confirmed_years(start: Optional[int], end: Optional[int],
     - Non-current position with only a start: [start] alone -- we do NOT assume
       the person stayed until the next station.
     - Only an end year: [end] alone.
+    - Current position with NO dates at all: [directory_year] -- the one year
+      the directory itself vouches for.
     """
     if start is not None and end is not None:
         if end < start:
@@ -1171,7 +1219,7 @@ def confirmed_years(start: Optional[int], end: Optional[int],
         return list(range(start, directory_year + 1)) if is_current else [start]
     if end is not None:
         return [end]
-    return []
+    return [directory_year] if is_current else []
 
 
 def _infer_country(state: Optional[str]) -> Optional[str]:
@@ -1374,13 +1422,12 @@ def build_panel(profiles: list[dict]) -> pd.DataFrame:
         events: dict[int, dict] = defaultdict(lambda: {"deg": [], "prim": [], "par": []})
 
         for deg in p.get("education") or []:
-            y = deg.get("year")
-            if y is None:
-                continue
-            events[y]["deg"].append({
-                "role": normalize_ocr(deg.get("degree_type") or ""),
-                "inst": normalize_ocr(deg.get("institution") or ""),
-            })
+            # A degreeless study spell can span a range ("Illinois, 88-90").
+            for y in confirmed_years(deg.get("year"), deg.get("end_year"), False):
+                events[y]["deg"].append({
+                    "role": normalize_ocr(deg.get("degree_type") or "study"),
+                    "inst": normalize_ocr(deg.get("institution") or ""),
+                })
 
         for job in p.get("employment") or []:
             is_cur = bool(job.get("is_current_position"))
@@ -1397,7 +1444,8 @@ def build_panel(profiles: list[dict]) -> pd.DataFrame:
             if not isinstance(mp, dict):
                 continue
             start = mp.get("start_year")
-            for y in confirmed_years(start, mp.get("end_year"), False):
+            for y in confirmed_years(start, mp.get("end_year"),
+                                     bool(mp.get("is_current_position"))):
                 events[y]["par"].append({
                     "role": normalize_ocr(mp.get("position_title") or ""),
                     "inst": normalize_ocr(mp.get("institution_org") or ""),
@@ -1511,9 +1559,10 @@ def build_events_long(profiles: list[dict]) -> pd.DataFrame:
         for deg in p.get("education") or []:
             rows.append({
                 **inv, "record_type": "Education",
-                "start_year": deg.get("year"), "end_year": deg.get("year"),
+                "start_year": deg.get("year"),
+                "end_year": deg.get("end_year") or deg.get("year"),
                 "institution_organization": normalize_ocr(deg.get("institution")),
-                "role_or_degree": normalize_ocr(deg.get("degree_type")),
+                "role_or_degree": normalize_ocr(deg.get("degree_type") or "study"),
                 "is_current_1927_role": 0,
             })
         for job in p.get("employment") or []:
@@ -1532,7 +1581,7 @@ def build_events_long(profiles: list[dict]) -> pd.DataFrame:
                 "start_year": mp.get("start_year"), "end_year": mp.get("end_year"),
                 "institution_organization": normalize_ocr(mp.get("institution_org")),
                 "role_or_degree": normalize_ocr(mp.get("position_title")),
-                "is_current_1927_role": 0,
+                "is_current_1927_role": 1 if mp.get("is_current_position") else 0,
             })
 
     df = pd.DataFrame(rows)
@@ -1568,7 +1617,8 @@ def build_summary(profiles: list[dict]) -> pd.DataFrame:
         societies = p.get("societies") or []
         rows.append({
             **inv,
-            "n_degrees": len(p.get("education") or []),
+            "n_degrees": sum(1 for d in p.get("education") or [] if d.get("degree_type")),
+            "n_study_spells": sum(1 for d in p.get("education") or [] if not d.get("degree_type")),
             "n_positions": len(p.get("employment") or []),
             "n_parallel_positions": len(p.get("minor_positions") or []),
             "societies": pipe_join(*societies),

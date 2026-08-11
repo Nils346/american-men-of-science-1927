@@ -280,6 +280,28 @@ def check_against_text_layer(page: int, profiles: list[dict], text: str,
                                "entr(y/ies) came back" % (surname, n_printed, n_returned)))
 
     check_birth_dates(page, profiles, text, out)
+    check_stars(page, profiles, text, out)
+
+
+def check_stars(page: int, profiles: list[dict], text: str,
+                out: list[Finding]) -> None:
+    """The printed asterisks and the returned star_status flags must agree.
+
+    A star prints directly before an entry's italic department ("*Botany") and
+    the OCR layer preserves it, so the counts are comparable. The model has both
+    starred an unstarred entry (a speck read as an asterisk) and the reverse, so
+    a mismatch in either direction is worth a look. Count-based on purpose:
+    which entry owns a star is a layout question the fragmented OCR cannot
+    settle, but how many stars a page carries it gets right.
+    """
+    printed = text.count("*")
+    returned = sum(1 for p in profiles if p.get("star_status"))
+    if printed != returned:
+        out.append(Finding(WARN, "star_mismatch", page, "",
+                           "page prints %d asterisk(s) but %d profile(s) came "
+                           "back starred: %s" % (printed, returned,
+                           ", ".join(surname_of(p) for p in profiles
+                                     if p.get("star_status")) or "none")))
 
 
 _BIRTH_DATE_RE = re.compile(r"^([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})$")
@@ -362,6 +384,13 @@ def check_page_yield(pages: dict[int, list[dict]], out: list[Finding]) -> None:
                                % (n, median)))
 
 
+# Degree abbreviations that have no business inside a birthplace. When the model
+# invents birth data it recycles the adjacent degree text ("A.B. Stanford").
+_DEGREE_TOKEN_RE = re.compile(
+    r"\b(?:A\.\s?B|B\.\s?A|B\.\s?S|S\.\s?B|A\.\s?M|M\.\s?A|M\.\s?S|Ph\.\s?[BD]"
+    r"|M\.\s?D|LL\.\s?[BD]|Sc\.\s?D|D\.\s?Sc|C\.\s?E|E\.\s?E|E\.\s?M)\b")
+
+
 def check_profile(page: int, p: dict, out: list[Finding]) -> None:
     name = p.get("full_name") or "(unnamed)"
     birth = p.get("birth_year")
@@ -371,12 +400,29 @@ def check_profile(page: int, p: dict, out: list[Finding]) -> None:
     elif not 1800 <= birth <= 1915:
         out.append(Finding(ERROR, "birth_year_implausible", page, name, str(birth)))
 
+    if p.get("birth_place") and _DEGREE_TOKEN_RE.search(p["birth_place"]):
+        out.append(Finding(ERROR, "birth_place_looks_like_degree", page, name,
+                           "birth_place=%r contains a degree abbreviation -- the "
+                           "birth fields were probably invented from the degree "
+                           "text" % p["birth_place"]))
+
     if not p.get("department"):
         out.append(Finding(WARN, "no_department", page, name, ""))
     if not p.get("education"):
         out.append(Finding(WARN, "no_education", page, name, ""))
     if not p.get("employment"):
         out.append(Finding(WARN, "no_employment", page, name, ""))
+
+    # The same degree letters twice is usually a study spell the model dressed
+    # up as a degree by copying its neighbour's type ("A.M, Denison, 94" and a
+    # phantom "A.M, Rochester Theol. Sem, 94" from "Rochester Theol. Sem, 94-96").
+    degree_counts = Counter(d.get("degree_type") for d in p.get("education") or []
+                            if d.get("degree_type"))
+    for deg, n in degree_counts.items():
+        if n > 1:
+            out.append(Finding(WARN, "duplicate_degree_type", page, name,
+                               "'%s' listed %d times -- check whether one is a "
+                               "degreeless study spell" % (deg, n)))
 
     # Chronology. Both confirmed birth-year misreads in the 10-page sample
     # (67 read as 87, 56 as 76) surfaced here as degrees earned in infancy.
@@ -416,7 +462,9 @@ def check_profile(page: int, p: dict, out: list[Finding]) -> None:
     if n_current == 0:
         out.append(Finding(WARN, "no_current_position", page, name,
                            "no italic 1927 role: panel years to 1927 will be blank"))
-    elif n_current > 2:
+    elif n_current > 4:
+        # Several concurrent roles (prof + consulting engineer + editor ...)
+        # are normal in this directory; only an implausible pile-up is flagged.
         out.append(Finding(WARN, "many_current_positions", page, name,
                            "%d positions marked current" % n_current))
 

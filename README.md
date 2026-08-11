@@ -283,6 +283,9 @@ hand-checking had found, plus three that hand-checking had missed:
 | `surname_not_printed` | Returned a surname the page never prints |
 | `milestone_before_adulthood` | A degree or post dated before age 15 — in practice a misread birth year |
 | `birth_date_not_on_page` | Extracted birth date leaves no trace in the page text — in practice invented. Some entries print no birth data (or a place with no date), and the model has been caught fabricating one from a degree year or from its own knowledge of the person |
+| `birth_place_looks_like_degree` | Birth place contains a degree abbreviation ("A.B. Stanford") — recycled degree text |
+| `star_mismatch` | The page prints a different number of asterisks than profiles came back starred |
+| `duplicate_degree_type` | The same degree letters twice in one profile — usually a study spell dressed up as a degree |
 | `page_overlap`, `duplicate_scientist` | The same entry captured on two pages |
 
 Candidate surnames are filtered to the alphabetical window the neighbouring pages
