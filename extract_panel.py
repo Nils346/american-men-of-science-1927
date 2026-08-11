@@ -341,6 +341,14 @@ item, in the same order. The two arrays MUST have the same length.
                    printed; null if only a year is given),
    birth_year    = 1889 (expand 2-digit years: these scientists were born in the
                    19th or very early 20th century).
+   Some entries print NO birth information at all: the italic department is
+   followed directly by the degrees ("... Los Angeles, Calif. Geology. A.B,
+   Stanford, 12, A.M, 15 ..."). Then EVERY birth field is null. Others print a
+   birthplace but no date ("... Psychology. Middleway, W. Va. LL.B, West
+   Virginia, 12 ..."); then birth_date and birth_year are null. NEVER derive a
+   birth date or year from a degree year, and NEVER supply facts from your own
+   knowledge of the person -- even when you recognise the scientist, this
+   dataset may contain only what THIS page prints.
 7. education: earned or honorary DEGREES only, in chronological order, e.g.
    "A.B, Brown, 13, A.M, 14, Ph.D, 18." A degree_type is a letter abbreviation
    such as A.B, B.S, A.M, M.S, Ph.D, Sc.D, M.D, LL.B, C.E, D.Sc (optionally
@@ -1617,6 +1625,13 @@ def run_panel_transformation(base_dir: Path, pdf_path: Optional[Path] = None) ->
     summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
     logger.info("Scientist summary written: %s (%d scientists).",
                 summary_path.name, len(summary))
+
+    # 4) Hand-verification workbook (one formatted row per scientist). QA flags
+    # come from qa_findings.csv if present; qa_check.py refreshes the workbook
+    # after each run, so run it afterwards for up-to-date flags.
+    import review_workbook
+    wb_path = review_workbook.write_workbook(profiles, base_dir)
+    logger.info("Review workbook written: %s.", wb_path.name)
 
 
 # ---------------------------------------------------------------------------

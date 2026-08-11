@@ -279,6 +279,35 @@ def check_against_text_layer(page: int, profiles: list[dict], text: str,
                                "'%s,' appears %d time(s) on the page but %d "
                                "entr(y/ies) came back" % (surname, n_printed, n_returned)))
 
+    check_birth_dates(page, profiles, text, out)
+
+
+_BIRTH_DATE_RE = re.compile(r"^([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})$")
+
+
+def check_birth_dates(page: int, profiles: list[dict], text: str,
+                      out: list[Finding]) -> None:
+    """An extracted birth date must be visible in the page's own text.
+
+    Some entries print no birth information, and the model has been caught
+    inventing one there -- from a degree year ("A.B, Stanford, 12" became a 1912
+    birth) or from its background knowledge of the person. A real date like
+    "March 1, 89" survives in the squashed text layer as "March1,89", so a date
+    with no such trace is probably fabricated.
+    """
+    for p in profiles:
+        m = _BIRTH_DATE_RE.match((p.get("birth_date") or "").strip())
+        if not m:
+            continue
+        month, day = m.group(1), int(m.group(2))
+        probe = re.compile(re.escape(month[:3]) + r"[a-z]*\.?" + str(day) + ",", re.I)
+        if not probe.search(text):
+            out.append(Finding(ERROR, "birth_date_not_on_page", page,
+                               p.get("full_name") or "",
+                               "extracted birth date %r does not appear on the "
+                               "page -- possibly invented (some entries print no "
+                               "birth data at all)" % p["birth_date"]))
+
 
 def check_ordering(pages: dict[int, list[dict]], out: list[Finding]) -> None:
     """The directory is strictly alphabetical.
@@ -498,6 +527,16 @@ def main() -> None:
 
     n_suspect = report(findings, pages, args.severity)
     print("Full findings written to %s" % out_path.name)
+
+    # Refresh the hand-verification workbook so its QA-flags column matches
+    # what was just found.
+    raw = base / "scientists_raw.json"
+    if raw.exists():
+        import review_workbook
+        profiles = json.loads(raw.read_text(encoding="utf-8"))
+        wb = review_workbook.write_workbook(profiles, base)
+        print("Review workbook refreshed: %s" % wb.name)
+
     sys.exit(1 if n_suspect else 0)
 
 

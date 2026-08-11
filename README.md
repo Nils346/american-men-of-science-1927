@@ -92,7 +92,20 @@ At `--pages 14 1123` this is roughly **$97 instead of $194**.
 
 ## Outputs
 
-The pipeline writes three CSVs plus a raw JSON archive:
+The pipeline writes a hand-verification Excel workbook, three CSVs for
+analysis, and a raw JSON archive:
+
+### 0. `review_workbook.xlsx` — hand-verification workbook (start here)
+
+One formatted row per scientist, columns in the order the information appears
+in a printed entry (name → star → address → field → birth → degrees → career →
+societies → research), so the eye can follow the book while checking. The
+header row and the page/name columns stay frozen while scrolling, every column
+is filterable, and a final **QA flags** column carries everything `qa_check.py`
+raised for that person — rows tint red (error) or amber (warning). A second
+sheet lists the raw QA findings for filtering by code. Regenerated on every
+panel build and after every `qa_check.py` run; standalone:
+`python review_workbook.py`.
 
 ### 1. `scientist_mobility_panel.csv` — balanced scientist-year panel (main)
 
@@ -269,6 +282,7 @@ hand-checking had found, plus three that hand-checking had missed:
 | `surname_misread` | Model spelling vs printed spelling disagree (`Boer` / `Beer`) |
 | `surname_not_printed` | Returned a surname the page never prints |
 | `milestone_before_adulthood` | A degree or post dated before age 15 — in practice a misread birth year |
+| `birth_date_not_on_page` | Extracted birth date leaves no trace in the page text — in practice invented. Some entries print no birth data (or a place with no date), and the model has been caught fabricating one from a degree year or from its own knowledge of the person |
 | `page_overlap`, `duplicate_scientist` | The same entry captured on two pages |
 
 Candidate surnames are filtered to the alphabetical window the neighbouring pages
