@@ -1,386 +1,149 @@
 # American Men of Science (1927) — Extraction Pipeline
 
-`extract_panel.py` extracts the ~13,500 biographical entries of the 4th Edition
-(1927) directory into a long-format Scientist-Year-Event panel
-(`scientist_mobility_panel.csv`) using the OpenAI vision API.
+Turns the ~13,500 biographical entries of the *American Men of Science* 4th
+Edition (1927) into an analysis-ready **scientist-year panel**, using the
+OpenAI vision API on page images, cross-checked against the PDF's own OCR text
+layer, with an Excel workbook for hand verification.
 
 **Source material:** [EDITIONS.md](EDITIONS.md) (PDF links) ·
 [DIRECTORY_REFERENCE.md](DIRECTORY_REFERENCE.md) (field notes for the 1927 volume)
 
-## Setup
+## Quickstart
 
 ```powershell
 pip install -r requirements.txt
-$env:OPENAI_API_KEY = "sk-..."          # or pass --api-key
+$env:OPENAI_API_KEY = "sk-..."
 ```
 
 Place the PDF in the project folder as
-`American Men of Science_4th edition_1927.pdf` (not committed to git — see
+`American Men of Science_4th edition_1927.pdf` (not committed — see
 [HathiTrust](https://babel.hathitrust.org/cgi/pt?id=mdp.39015039431948&seq=7)).
 
-## Usage
+**Real runs go through the Batch API (half price, results within 24 h):**
 
 ```powershell
-# 1. Free dry run: renders page images, no API calls
-python extract_panel.py --pages 15 16 --dry-run
-
-# 2. Test run: extracts focus pages 15 and 16 only, then builds the CSV
-python extract_panel.py --test-run --pages 15 16
-
-# 3. Full run over the whole listing (PDF pages 14–1123)
-python extract_panel.py --pages 14 1123
-
-# Rebuild the CSV from the checkpoint without any API calls
-python extract_panel.py --panel-only
-
-# Start over from scratch (deletes checkpoint + failed-pages log)
-python extract_panel.py --fresh --pages 14 1123
+python batch_extract.py submit --pages 14 1123   # queue the whole listing
+python batch_extract.py status                   # check progress any time
+python batch_extract.py harvest --wait           # collect into the checkpoint
+python extract_panel.py --panel-only             # build CSVs + workbook
+python qa_check.py                               # free quality report
 ```
 
-### Batch API (half price — use this for real runs)
-
-`batch_extract.py` sends the same prompt, schema and model through OpenAI's
-Batch API, which costs **50% less** than live calls. The trade is latency:
-results are promised within 24 hours rather than arriving page by page. Submit
-and harvest are separate commands, so you can close the laptop in between.
-
-```powershell
-python batch_extract.py submit --pages 14 1123   # queues, returns immediately
-python batch_extract.py status                   # cheap progress check
-python batch_extract.py harvest --wait           # poll, then write the checkpoint
-python extract_panel.py --panel-only             # build the CSVs
-```
-
-Harvested pages land in `extraction_checkpoint.jsonl` in exactly the format live
-extraction writes, so the two modes are interchangeable and resumable against
-each other. `submit` skips pages already in the checkpoint. Batch IDs are kept
-in `batch_state.json`, which is what lets `harvest` run in a later session.
-
-Page images are large (~2 MB of base64 per request), so a full run exceeds the
-200 MB cap on a single batch input file; the requests are sharded automatically
-into as many batches as needed (about 13 for the full listing).
-
-At `--pages 14 1123` this is roughly **$97 instead of $194**.
-
-## How it works
-
-- **Focus + Look-Ahead windows:** each API call sends images of page N (focus)
-  and page N+1 (look-ahead). Only entries that *begin* on the focus page are
-  extracted; entries spilling onto N+1 are completed from the look-ahead image,
-  and entries continued from N−1 are ignored (already captured).
-- **Spelling cross-check from the print layer:** each request also carries the
-  entry headings as the PDF's own OCR text layer reads them. The vision model's
-  characteristic error is normalising a rare surname to a familiar one (`Becket`
-  → `Beckett`, `Beetle` → `Beattie`), which the OCR never does, so the model is
-  told to trust the list for name spellings — and *only* for spellings: the list
-  misses garbled headings, so the image alone decides which entries exist.
-- **Validation:** the request pins a strict JSON Schema via OpenAI Structured
-  Outputs, and the reply is re-parsed against the matching Pydantic contract
-  (`PageExtractionContainer` → `ScientistProfile` → degree/employment records).
-- **Fault tolerance:** exponential-backoff retries (up to 5) on 429/5xx/network
-  errors via `tenacity`; truncated or unparseable responses are logged to
-  `failed_pages.log` with raw output saved under `debug/`, and the run continues.
-  A rejected key fails fast — the model is checked once before any page is sent,
-  and an auth error mid-run aborts instead of burning through the remaining pages.
-- **Checkpointing & resume:** each successful page window is appended to
-  `extraction_checkpoint.jsonl` (fsync'd). Re-running the same command skips
-  completed pages automatically and retries failed ones.
-- **Panel build:** after extraction, nested records are flattened so each row is
-  one Scientist-Year-Event (Education or Employment) observation, written to
-  `scientist_mobility_panel.csv`. Raw nested profiles are archived to
-  `scientists_raw.json`.
+Live (non-batch) extraction with the same behaviour:
+`python extract_panel.py --pages 14 1123`. Both modes write the same
+resumable `extraction_checkpoint.jsonl` — interrupting and re-running is
+always safe, completed pages are skipped.
 
 ## Outputs
 
-The pipeline writes a hand-verification Excel workbook, three CSVs for
-analysis, and a raw JSON archive:
-
-### 0. `review_workbook.xlsx` — hand-verification workbook (start here)
-
-One formatted row per scientist, columns in the order the information appears
-in a printed entry (name → star → address → field → birth → degrees → career →
-societies → research), so the eye can follow the book while checking. The
-header row and the page/name columns stay frozen while scrolling, every column
-is filterable, and a final **QA flags** column carries everything `qa_check.py`
-raised for that person — rows tint red (error) or amber (warning). A second
-sheet lists the raw QA findings for filtering by code. Regenerated on every
-panel build and after every `qa_check.py` run; standalone:
-`python review_workbook.py`.
-
-### 1. `scientist_mobility_panel.csv` — balanced scientist-year panel (main)
-
-One row **per scientist per calendar year**, from the scientist's birth year
-through 1927 (the edition year). Activity columns are filled **only where the
-directory confirms activity** — a dated degree, a dated employment spell/range,
-or a dated parallel position. Gaps between separate confirmed stations are left
-blank (no interpolation). A confirmed employment **range** (e.g. `14-17`) fills
-every year in that range; the italicized **current** position fills from its
-start year through 1927; a single-year station fills only that one year.
-
-Columns (in order): `year`, `first_name`, `last_name`, `scientist_name`,
-`title`, `age`, `activity_confirmed` (0/1), then **numbered slot columns**
-`degree_earned_1`/`degree_institution_1` (…_2, …), `position_1`/`institution_1`
-(…_2, …), `is_current_1927_role` (0/1), `parallel_position_1`/
-`parallel_institution_1` (…_2, …), then `birth_year`, `birth_date` (DD.MM.YYYY),
-`birth_city`, `birth_state`, `birth_country`, `star_status` (0/1),
-`primary_department`, `mailing_city`, `mailing_state`, `mailing_country`,
-`research` (accomplished + in-progress subjects combined, `|`-separated),
-`source_pdf_page`.
-
-`research` is blank only when the directory entry itself lists no research
-subjects (some entries have none). Society memberships live in
-`scientist_summary.csv`, not in the panel.
-
-Multi-value cells (`research`, and `societies` in the summary file) use a pipe
-` | ` as the in-cell separator, **not** a semicolon. Semicolon is Excel's list
-separator in several locales (e.g. German), so an in-cell `;` breaks
-Text-to-Columns; the pipe never does. To split research subjects into their own
-columns in Excel: select the column, Data → Text to Columns → Delimited →
-Other = `|`.
-
-OCR note: the italic typeface confuses s/z, so `zool` was frequently misread as
-`sool`. A deterministic normalizer rewrites `sool`->`zool` in the derived CSVs
-(the raw model output in `scientists_raw.json` is left untouched). Bare
-carried-forward position words are reconstructed per the directory's own
-convention, e.g. `biol` following `Instr. zool` becomes `Instr. biol`.
-
-**Concurrent positions never share a cell.** When more than one position covers
-the same year — overlapping spells, or a mid-year career transition — each one is
-written to its own numbered slot (`position_1`, `position_2`, …). The number of
-slots equals the maximum concurrency seen in the data, so every cell holds a
-single value (panel-ready). For primary positions the italic current-1927 role is
-placed in `position_1` whenever it is active; other years are ordered by start
-year. Parallel/temporary roles (fellowships, military, committee/editorial, summer
-posts) use the separate `parallel_position_*` slots so they never collide with the
-main career track.
-
-### 2. `scientist_events_long.csv` — lossless event audit
-
-One row per **dated event** (Education / Employment / MinorPosition) with the
-explicit `start_year` and `end_year` preserved (not expanded). Use this to
-verify spell durations or rebuild the panel differently.
-
-### 3. `scientist_summary.csv` — one row per scientist
-
-Time-invariant attributes plus `societies`, `research_accomplished`,
-`research_in_progress`, and counts (`n_degrees`, `n_positions`,
-`n_parallel_positions`).
-
-### 4. `scientists_raw.json`
-
-The full nested LLM output, the source of truth from which all three CSVs are
-derived (rebuild any time with `--panel-only`).
-
-## Institution geography (hand-coded, post-extraction)
-
-The directory usually prints institution names only (`Brown`, `Yale`) — not countries.
-To study migration without guessing, code locations yourself:
-
-```powershell
-# 1. After extraction, export every unique institution string:
-python merge_institution_locations.py --export
-#    (creates institution_locations.csv from institution_locations.example.csv
-#     if the file does not exist yet)
-
-# 2. Open institution_locations.csv in Excel; fill city / state_region / country
-#    only where you are confident. Leave blank when unsure.
-
-# 3. Merge back into the event audit table:
-python merge_institution_locations.py --apply
-```
-
-This adds `institution_city`, `institution_state_region`, and `institution_country`
-to `scientist_events_long.csv` for exact institution-string matches only.
-
-## Model choice
-
-The default is **`gpt-5.6-sol`** ($5 / $30 per M input/output). It was chosen
-over the cheaper `gpt-5.6-terra` on measured transcription accuracy, not on
-reputation — see the comparison below. `gpt-5.6-terra` ($2.50 / $15) is the
-closest counterpart to the Sonnet-tier model this pipeline originally used and
-remains a reasonable choice if budget is the binding constraint;
-`gpt-5.6-luna` is the cheap tier. Any vision-capable OpenAI model works via
-`--model`.
-
-Reasoning tokens are billed as output, so `--reasoning-effort` defaults to
-`low`. Raising it did **not** measurably improve boundary accuracy in testing
-(see below) but did roughly double the output tokens.
-
-### Terra vs Sol, measured
-
-Ten calls across the three hardest pages (79, 82, 83 — the ones with the longest
-runs of repeated surnames), full-name roster prompt, effort `low`:
-
-| | `gpt-5.6-terra` | `gpt-5.6-sol` |
-| --- | --- | --- |
-| Entries returned (truth 68) | 66 | 65 |
-| Surnames misread | 19 | 7 |
-| Runs with a phantom entry | 1 of 5 | 0 of 5 |
-| Cost per page | $0.108 | $0.175 |
-| Full run, 1110 pages | ~$120 | ~$194 |
-
-Both models now find the same number of entries; the roster fix, not the model,
-is what closed the counting gap. Sol's advantage is **transcription fidelity** —
-it misread less than half as many surnames, and on page 79 it returned all
-thirteen spellings correctly where Terra produced `Beare` for `Bear`/`Bearce`
-and `Bean` for `Beans`. Terra also has a systematic misread of this typeface,
-turning `Behre` into `Behro` on every attempt.
-
-Sol costs ~$72 more over the full listing at list price, or ~$36 more through
-the Batch API. Surnames are the linking key to other sources, so a misread is
-not a cosmetic problem, and that margin buys back half of them.
-
-## API budget estimate (full listing, pages 14–1123)
-
-Measured on the hard-page sample at 150 DPI, reasoning effort `low`:
-
-| Metric | Value |
+| File | Contents |
 | --- | --- |
-| Focus pages | 1,110 |
-| Avg input tokens / page | ~7,240 (~3,000 served from cache) |
-| Avg output tokens / page | ~5,500 (~1,000 of them reasoning) |
-| Scientists / page | ~12.3 |
-| Wall-clock / page (live calls) | ~45 s |
+| `review_workbook.xlsx` | **Start here for verification.** One formatted row per scientist, columns in print order, frozen header/name panes, rows tinted red/amber by QA severity, all QA flags attached. Second sheet: raw QA findings. |
+| `scientist_mobility_panel.csv` | **Main output.** Balanced panel, one row per scientist per year (birth–1927). Activity filled only where the directory confirms it — never interpolated. Concurrent positions get numbered slot columns, never a shared cell. |
+| `scientist_events_long.csv` | Lossless audit table: one row per dated degree / employment spell / minor position, ranges preserved. |
+| `scientist_summary.csv` | One row per scientist: invariants, societies, research subjects, counts. |
+| `scientists_raw.json` | Full nested model output; all CSVs rebuild from it via `--panel-only`. |
 
-| Model and tier | Estimated total |
-| --- | ---: |
-| `gpt-5.6-sol`, **Batch API** (the default path) | **~$97** |
-| `gpt-5.6-sol`, live calls | ~$194 |
-| `gpt-5.6-terra`, Batch API | ~$60 |
-| `gpt-5.6-terra`, live calls | ~$120 |
-| Recommended budget request (Sol batch, +15% for retries) | **~$112** |
+Multi-value cells use ` | ` as separator (never `;`, which breaks Excel in
+several locales). Optional: hand-code institution locations with
+`python merge_institution_locations.py --export` → fill the CSV → `--apply`.
 
-Live calls take ~45 s per page, so a sequential full run is roughly **14 hours**.
-The Batch API halves the bill and needs no babysitting, at the cost of up to 24
-hours of latency. Either way the checkpoint makes the run fully resumable, so
-interrupting it is safe.
+## How it works
 
-Re-run cost check after more pages: token totals are logged per page in
-`pipeline.log` and stored in `extraction_checkpoint.jsonl` under `usage`.
+1. **Focus + look-ahead:** each request carries page N and N+1 as images;
+   only entries *beginning* on N are extracted, completed from the look-ahead
+   if they spill over.
+2. **Roster first:** the model must list every entry's full bold heading
+   before transcribing details. Full headings are unique within a page, which
+   stops it collapsing runs of repeated surnames (the dominant omission mode).
+3. **Spelling cross-check:** the prompt includes the entry headings as the
+   PDF's OCR layer reads them. The vision model normalises rare surnames
+   toward familiar ones (`Bear`→`Bean`); the OCR never does. The list is
+   authoritative for spelling only — the image decides what exists.
+4. **Strict schema:** replies are constrained by a JSON Schema (OpenAI
+   Structured Outputs) and re-validated with Pydantic.
+5. **Subtractive repair:** birth data that leaves no trace in the entry's own
+   printed text is nulled at panel build (the model occasionally invents a
+   birthday from a degree year or from its knowledge of a famous scientist).
+   Repair only removes values, never writes them; disputed months are kept
+   and flagged instead.
+6. **Checkpoint everything:** per-page results append to
+   `extraction_checkpoint.jsonl` (fsync'd); failures land in
+   `failed_pages.log` + `debug/` and the run continues.
 
-## Quality control (`qa_check.py`)
+## Quality control
 
-```powershell
-python qa_check.py                  # everything, writes qa_findings.csv
-python qa_check.py --severity error # only near-certain problems
-python qa_check.py --pages 75 84    # one range
-```
+`qa_check.py` makes no API calls and exists because the worst failure mode is
+silent: a dropped entry or mangled name still reports "success". Its strongest
+tool is the PDF's own OCR text layer — too fragmented to extract data from,
+but an *independent* reading of the same page, so disagreement is a reliable
+review trigger. On the 10-page sample it caught every error hand-checking
+found, plus several hand-checking missed.
 
-Makes **no API calls**, so run it as often as you like. It exists because the
-pipeline's worst failure mode is silent: the model sometimes drops an entry or
-mangles a surname and still reports success, so `failed_pages.log` stays empty.
+Checks fall into four groups:
 
-The strongest check exploits the fact that the PDF carries its **own OCR text
-layer**. That layer is far too fragmented to extract structured data from, but it
-is an *independent* reading of the same page, so disagreement is a reliable
-review trigger. Concretely, on the 10-page sample it caught every error that
-hand-checking had found, plus three that hand-checking had missed:
+- **Completeness** — entries the page prints but the model never returned;
+  overlaps and duplicates across pages; pages with implausibly few entries.
+- **Fidelity** — surnames that disagree with the print; star counts that
+  disagree with the page's printed asterisks; birth dates/months without a
+  printed trace.
+- **Plausibility** — degrees or jobs before age 15 (a misread birth year in
+  practice), years outside 1800–1927, spells that end before they start.
+- **Structure** — duplicate degree types (often a study spell dressed up as a
+  degree), degrees with no institution and no year, degree letters fused into
+  an institution name, missing current position.
 
-| Finding | Meaning |
-| --- | --- |
-| `entry_possibly_missed` | The page prints an entry the model never returned |
-| `surname_misread` | Model spelling vs printed spelling disagree (`Boer` / `Beer`) |
-| `surname_not_printed` | Returned a surname the page never prints |
-| `milestone_before_adulthood` | A degree or post dated before age 15 — in practice a misread birth year |
-| `birth_date_not_on_page` | Extracted birth date leaves no trace in the page text — in practice invented. Some entries print no birth data (or a place with no date), and the model has been caught fabricating one from a degree year or from its own knowledge of the person |
-| `birth_place_looks_like_degree` | Birth place contains a degree abbreviation ("A.B. Stanford") — recycled degree text |
-| `star_mismatch` | The page prints a different number of asterisks than profiles came back starred |
-| `duplicate_degree_type` | The same degree letters twice in one profile — usually a study spell dressed up as a degree |
-| `page_overlap`, `duplicate_scientist` | The same entry captured on two pages |
+Errors demand action; warnings are review pointers (several flag genuinely
+unusual print, like two honorary Sc.D.s). The script exits non-zero and lists
+pages worth re-extracting.
 
-Candidate surnames are filtered to the alphabetical window the neighbouring pages
-define, which discards the OCR debris (glued running headers, hyphenated line
-breaks) that would otherwise dominate the output. The script exits non-zero when
-any page looks worth re-extracting and prints that page list.
+## Accuracy, measured on the 10-page hand-checked sample
 
-## Known accuracy limit: page-boundary drift
+- **127/127 entries returned, zero missed, zero misread surnames** after the
+  roster + spelling-cross-check fixes (earlier: ~3% silently dropped, 5
+  corrupted surnames). Model nondeterminism means a rare drop can still
+  happen — `qa_check.py` catches it, so re-extract flagged pages before
+  treating the panel as final.
+- **Invented birth data is the one behaviour prompting cannot fully stop**
+  (2–3 entries per 10 pages). The subtractive repair strips every occurrence;
+  affected rows keep an amber flag in the workbook.
+- Residual field-level slips (~1–2 per 10 pages) concentrate where the
+  two-column print itself is scrambled; they surface as warnings, not
+  silently.
+- `--max-passes 2` (union-merging repeat passes) is available but **off**: it
+  fixed one page and broke another by letting a mangled twin survive as a
+  phantom scientist.
 
-Repeated extractions of the *same* page do not always return the same set of
-entries. On sample page 84 (12 entries by hand count) five runs returned 10, 11,
-11, 12 and 12 entries. The failure modes are dropped entries at the top of the
-focus page and occasional leakage of an entry from the look-ahead page. Effort
-levels `low`, `medium` and `high` all showed the drift, so it is not fixed by
-spending more on reasoning.
+## Model & cost
 
-Omissions are not confined to page edges. Sample page 83 dropped an entry from
-the *middle* of a column, and the 10-page sample contained **4 missed entries
-across 125 profiles (~3%)** plus **5 corrupted surnames**.
+Default **`gpt-5.6-sol`** ($5/$30 per M tokens), chosen over `gpt-5.6-terra`
+on a measured A/B: same entry counts, but Sol misread less than half as many
+surnames (7 vs 19 on the three hardest pages). Surnames are the linking key,
+so the ~$50 premium buys the right thing. `--reasoning-effort low` — raising
+it doubled output tokens without improving accuracy.
 
-The drops are not uniformly random: they concentrate on **runs of repeated
-surnames**. A page printing Beckwith five times, Behre three times or Bean four
-times is where entries go missing — the model collapses the run and loses count.
-Pages of distinct surnames extract cleanly.
+Measured on the full 10-page sample (**$0.099/page through the Batch API**):
 
-**Fix: roster by full name before transcribing.** The model now has to list the
-*complete bold heading* of every entry beginning on the page —
-`Behre, Dr. J(eanette) A(llen)` — into `entries_beginning_on_focus_page` before
-it writes any detail, and the schema declares that field ahead of `scientists`
-so it is generated first. The full heading is the unit of identity, never the
-surname: within a page every heading is distinct, so there is no run of
-identical tokens for the model to lose count of. An earlier version of this idea
-rostered *surnames*, which reproduced the bug inside the roster itself
-(`Behre, Behre` for three Behres) and then faithfully propagated the undercount.
+| | Batch API | Live |
+| --- | ---: | ---: |
+| `gpt-5.6-sol` (default), 1,110 pages | **~$110** | ~$220 |
+| `gpt-5.6-terra`, 1,110 pages | ~$60 | ~$120 |
+| Recommended budget (Sol batch +15% buffer) | **~$127** | |
 
-The collapse is essentially gone. Page 83 (13 entries, `Behre` ×3, `Beeson` ×2)
-had been returning 11–12 and now returns 13. The `Beckwith` ×5 and `Beebe` ×4
-runs on page 82 come through complete.
+A live sequential run takes ~14 h (~45 s/page); batch needs no babysitting.
+Per-page token usage is logged in the checkpoint under `usage`.
 
-**What "missing" turned out to mean afterwards: rewritten surnames.** Auditing
-the first full 10-page run with this roster showed no true omissions at all.
-Every entry QA flagged as missed was present with all its data under a
-*misspelled surname*: the model normalises rare names toward its prior or
-toward the neighbouring run (`Bear, Firman E.` came back as *Bean* amid four
-printed Beans; `Becket` as *Beckett*; `Beetle` as *Beattie*; `Beilby` as
-*Belhy*), plus a recurring C↔O glyph confusion (`C(laus)` → `O(laus)`). More
-reasoning does not fix this — it is the language prior overriding the pixels.
-
-**Fix: the print-layer spelling cross-check** described under *How it works*.
-The PDF's own OCR read every one of those names correctly — the two readers
-fail in different ways — so feeding the OCR headings into the prompt as the
-spelling authority removed **all 8 surname corruptions on the four affected
-pages**, at a cost of a few hundred input tokens per page. One caution is
-baked into the prompt wording: the heading list must never be treated as the
-roster. In one early trial the model anchored to an 11-item list on a 12-entry
-page and dropped the entry the OCR had garbled (`Belknap`); the list patterns
-were widened and the prompt now states explicitly that the list routinely
-misses headings and the image alone decides what exists, after which the page
-returned 12/12 with every spelling correct.
-
-**Multi-pass merge (off by default).** With `--max-passes` above 1 the text
-layer is consulted after each page, and if it says the pass came up short the
-page is extracted again and the passes are merged as a *union*. Because the
-drops are near-random, two passes rarely lose the same scientist, and the merge
-also repairs spellings: where two passes disagree, the one the text layer
-confirms wins, so `Boer` becomes `Beer`.
-
-It is off by default because it trades one error for another. On the four
-hand-verified pages it scored no better overall: it fixed page 83 (12 → 13,
-correct) but left page 80 one *over* — a mangled entry that no longer matched
-its twin and so survived the union as a second copy of a real scientist. A
-phantom scientist is worse than a missing one, since it silently enters the
-panel as a real observation. Turn it on only if you would rather over-collect
-and filter by hand.
-
-Alphabetical ordering alone does **not** catch this. Ordering detects overlaps
-and duplicates, but a gap in the alphabet is indistinguishable from two
-genuinely adjacent surnames, so a dropped entry leaves the chain intact. Use
-`qa_check.py`, whose text-layer cross-check does detect omissions, and re-extract
-the pages it flags before treating the panel as final.
-
-Corrupted surnames deserve particular attention if the panel will be linked to
-other sources: the errors seen so far mangle the *end* of the name
-(`Behre`→`Behr`, `Beghtel`→`Beghte`, `Bawden`→`Bawen`, `Belfield`→`Belsfield`).
-
-## Key CLI options
+## Key CLI options (`extract_panel.py`)
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--pages START END` | 14 1123 | Inclusive 1-based PDF page range of focus pages |
-| `--test-run` | off | Restrict to the first 2 focus pages of the range |
-| `--model` | `gpt-5.6-sol` | OpenAI model ID |
-| `--reasoning-effort` | `low` | `none`/`low`/`medium`/`high`/`xhigh`; billed as output tokens |
+| `--pages START END` | 14 1123 | Inclusive 1-based PDF page range |
+| `--test-run` | off | First 2 focus pages of the range only |
+| `--dry-run` | off | Render images, no API calls |
+| `--panel-only` | off | Rebuild CSVs/workbook from checkpoint, no API calls |
+| `--fresh` | off | Delete checkpoint and start over |
+| `--model` | `gpt-5.6-sol` | Any vision-capable OpenAI model |
+| `--reasoning-effort` | `low` | Billed as output tokens |
 | `--dpi` | 150 | Page image resolution |
-| `--max-tokens` | 32000 | Output token cap per call (raise if pages truncate) |
-| `--max-passes` | 1 | Above 1, re-extracts pages the text layer says came up short and unions the passes (can duplicate; see below) |
-| `--no-verify` | off | Skip the free omission check (one pass per page) |
+| `--max-passes` | 1 | >1 unions repeat passes on short pages (see above) |
 | `--api-key` | `$OPENAI_API_KEY` | OpenAI API key |

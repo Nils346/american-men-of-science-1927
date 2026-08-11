@@ -484,8 +484,9 @@ def check_page_yield(pages: dict[int, list[dict]], out: list[Finding]) -> None:
 # Degree abbreviations that have no business inside a birthplace. When the model
 # invents birth data it recycles the adjacent degree text ("A.B. Stanford").
 _DEGREE_TOKEN_RE = re.compile(
-    r"\b(?:A\.\s?B|B\.\s?A|B\.\s?S|S\.\s?B|A\.\s?M|M\.\s?A|M\.\s?S|Ph\.\s?[BD]"
-    r"|M\.\s?D|LL\.\s?[BD]|Sc\.\s?D|D\.\s?Sc|C\.\s?E|E\.\s?E|E\.\s?M)\b")
+    r"\b(?:A\.\s?B|B\.\s?A|B\.\s?S|S\.\s?B|A\.\s?M|M\.\s?A|M\.\s?S|Ph\.\s?[BDG]"
+    r"|M\.\s?D|LL\.\s?[BD]|Sc\.\s?D|D\.\s?Sc|C\.\s?E|E\.\s?E|E\.\s?M|M\.\s?E"
+    r"|Pharm\.\s?D|D\.\s?D\.?S)\b")
 
 
 def check_profile(page: int, p: dict, out: list[Finding]) -> None:
@@ -545,6 +546,15 @@ def check_profile(page: int, p: dict, out: list[Finding]) -> None:
                                "degree %r has neither institution nor year -- "
                                "it may share its neighbour's printed ones"
                                % d["degree_type"]))
+        # The opposite fusion: the neighbouring degree letters glued into the
+        # institution ("M.E. Va. Polytech", "A.M. Hopkins") -- two printed
+        # degrees came back as one record.
+        if _DEGREE_TOKEN_RE.match(d.get("institution") or ""):
+            out.append(Finding(WARN, "degree_glued_into_institution", page,
+                               name,
+                               "institution %r starts with a degree "
+                               "abbreviation -- two printed degrees were "
+                               "probably fused into one" % d["institution"]))
 
     n_current = 0
     for e in p.get("employment") or []:

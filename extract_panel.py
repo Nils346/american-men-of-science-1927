@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import difflib
 import json
 import logging
 import os
@@ -1189,16 +1188,6 @@ def pipe_join(*chunks) -> Optional[str]:
             if piece:
                 parts.append(piece)
     return " | ".join(parts) if parts else None
-
-
-def _join_distinct(values) -> str:
-    """Join non-empty, de-duplicated strings with ' | ' (preserves first order)."""
-    seen: list[str] = []
-    for v in values:
-        v = (v or "").strip()
-        if v and v not in seen:
-            seen.append(v)
-    return " | ".join(seen)
 
 
 def confirmed_years(start: Optional[int], end: Optional[int],
