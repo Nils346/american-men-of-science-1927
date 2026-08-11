@@ -59,6 +59,8 @@ ERROR, WARN = "error", "warn"
 ENTRY_START_PATTERNS = [
     re.compile(r"([A-Z][a-z'\-]{1,20}),(?:Dr|Prof|Mrs|Miss|Mr|Dean|Rev|Gen|Col|Capt|Sir)\."),
     re.compile(r"([A-Z][a-z'\-]{1,20}),[A-Z]\("),
+    # First initial's opening parenthesis lost by the OCR: "Belknap,William)E(".
+    re.compile(r"([A-Z][a-z'\-]{1,20}),[A-Z][a-z]+\)[A-Z]\("),
 ]
 
 RUNNING_HEADER = re.compile(r"AMERICANMENOFSCIENCE", re.I)
@@ -122,6 +124,42 @@ def entry_start_candidates(text: str) -> set[str]:
 
 def printed_count(text: str, surname: str) -> int:
     return len(re.findall(re.escape(surname) + ",", text))
+
+
+# Same entry-start shapes as ENTRY_START_PATTERNS, but tolerant of the OCR's
+# erratic single spaces ("Bear , Prof.") instead of requiring squashed text.
+_HEADING_PATTERNS = [
+    re.compile(r"[A-Z][a-z'\-]{1,20} ?, ?(?:Dr|Prof|Mrs|Miss|Mr|Dean|Rev|Gen|Col|Capt|Sir)\."),
+    re.compile(r"[A-Z][a-z'\-]{1,20} ?, ?[A-Z] ?\("),
+    # No honorific, spelled-out first name: "Bearce, Henry W(alter)". The
+    # trailing initial-with-parenthesis keeps city/state pairs from matching.
+    re.compile(r"[A-Z][a-z'\-]{1,20} ?, ?[A-Z][a-z]+ [A-Z] ?\("),
+    # OCR dropped the opening parenthesis of the first initial:
+    # "Belknap, William ) E(thelbert" was printed as "Belknap, W(illiam) E(thelbert)".
+    re.compile(r"[A-Z][a-z'\-]{1,20} ?, ?[A-Z][a-z]+ ?\) ?[A-Z] ?\("),
+]
+
+
+def printed_headings(doc: fitz.Document, page_1based: int) -> list[str]:
+    """Entry headings as the print layer reads them, in print order.
+
+    Used as a spelling cross-check in the extraction prompt: the vision model's
+    characteristic failure is normalising a rare surname to a familiar one
+    (Becket -> Beckett), which the page's own OCR never does. Best-effort only:
+    a heading broken across a line hyphen is silently absent from the result.
+    """
+    text = re.sub(r"\s+", " ", doc[page_1based - 1].get_text())
+    text = re.sub(r"AMERICAN ?MEN ?OF ?SCIENCE", "", text, flags=re.I)
+
+    headings = []
+    for start in sorted({m.start() for p in _HEADING_PATTERNS for m in p.finditer(text)}):
+        # A heading runs "Surname, [honorific.] given names," -- everything up
+        # to the second comma; the address or department follows it.
+        head = ",".join(text[start:start + 90].split(",")[:2])
+        head = re.sub(r" ([,).])", r"\1", head)
+        head = re.sub(r"\( ", "(", head)
+        headings.append(head.strip())
+    return headings
 
 
 def find_omissions(text: str, returned: Counter, window: tuple[str, str]

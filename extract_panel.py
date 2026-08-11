@@ -447,7 +447,8 @@ def _png_data_url(png: bytes) -> str:
 
 
 def build_user_content(focus_page_1based: int, focus_png: bytes,
-                       lookahead_png: Optional[bytes]) -> list:
+                       lookahead_png: Optional[bytes],
+                       printed_headings: Optional[list[str]] = None) -> list:
     """Assemble the multimodal user message for one Focus + Look-Ahead window."""
     content = [
         {
@@ -465,6 +466,29 @@ def build_user_content(focus_page_1based: int, focus_png: bytes,
         # "high" detail keeps the small italic type in the two-column scan legible.
         {"type": "input_image", "image_url": _png_data_url(focus_png), "detail": "high"},
     ]
+    if printed_headings:
+        content.insert(1, {
+            "type": "input_text",
+            "text": (
+                "SPELLING CROSS-CHECK. The page's embedded print layer -- an "
+                "independent, imperfect OCR of the same scan -- reads these entry "
+                "headings on the FOCUS page, in print order:\n"
+                + "\n".join("  " + h for h in printed_headings)
+                + "\n\nUse this list ONLY to verify the spelling of surnames and "
+                  "name initials. The directory is full of rare surnames that "
+                  "resemble familiar ones; do NOT normalise them (Becket is not "
+                  "Beckett, Beetle is not Beattie, Bear is not Bean). When your "
+                  "reading of a bold heading differs from this list only in "
+                  "spelling, the list is usually right.\n"
+                  "WARNING: this list is NOT the roster. It routinely MISSES one "
+                  "or two headings per page (the OCR garbles them), so the page "
+                  "usually prints MORE entries than the list shows. Build the "
+                  "roster from the IMAGE alone; every bold heading in the image "
+                  "is an entry even when it is absent here, and its detail must "
+                  "be transcribed in full. Never drop, merge or add an entry "
+                  "because of this list."
+            ),
+        })
     if lookahead_png:
         content.append({"type": "input_image",
                         "image_url": _png_data_url(lookahead_png),
@@ -653,12 +677,14 @@ class ExtractionClient:
             raise
 
     def extract_page(self, focus_page_1based: int, focus_png: bytes,
-                     lookahead_png: Optional[bytes]) -> tuple[str, dict]:
+                     lookahead_png: Optional[bytes],
+                     printed_headings: Optional[list[str]] = None) -> tuple[str, dict]:
         """Call the API for one window; return (raw_text, usage_dict).
 
         Raises TruncatedResponseError if the output hit the token wall.
         """
-        content = build_user_content(focus_page_1based, focus_png, lookahead_png)
+        content = build_user_content(focus_page_1based, focus_png, lookahead_png,
+                                     printed_headings)
         response = self._call(content)
 
         usage_obj = getattr(response, "usage", None)
@@ -876,10 +902,12 @@ def run_extraction(args, base_dir: Path) -> None:
         raw_text = ""
         try:
             page_text = "" if args.no_verify else qa_check.squashed_text(doc, page)
+            headings = qa_check.printed_headings(doc, page)
             profiles: list[dict] = []
 
             for attempt in range(1, max(1, args.max_passes) + 1):
-                raw_text, usage = client.extract_page(page, focus_png, lookahead_png)
+                raw_text, usage = client.extract_page(page, focus_png, lookahead_png,
+                                                      headings)
                 container = parse_llm_json(raw_text)
                 container.focus_page_number = page   # trust our loop, not the model
                 profiles = [s.model_dump() for s in container.scientists]

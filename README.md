@@ -68,6 +68,12 @@ At `--pages 14 1123` this is roughly **$97 instead of $194**.
   and page N+1 (look-ahead). Only entries that *begin* on the focus page are
   extracted; entries spilling onto N+1 are completed from the look-ahead image,
   and entries continued from N−1 are ignored (already captured).
+- **Spelling cross-check from the print layer:** each request also carries the
+  entry headings as the PDF's own OCR text layer reads them. The vision model's
+  characteristic error is normalising a rare surname to a familiar one (`Becket`
+  → `Beckett`, `Beetle` → `Beattie`), which the OCR never does, so the model is
+  told to trust the list for name spellings — and *only* for spellings: the list
+  misses garbled headings, so the image alone decides which entries exist.
 - **Validation:** the request pins a strict JSON Schema via OpenAI Structured
   Outputs, and the reply is re-parsed against the matching Pydantic contract
   (`PageExtractionContainer` → `ScientistProfile` → degree/employment records).
@@ -300,8 +306,28 @@ rostered *surnames*, which reproduced the bug inside the roster itself
 
 The collapse is essentially gone. Page 83 (13 entries, `Behre` ×3, `Beeson` ×2)
 had been returning 11–12 and now returns 13. The `Beckwith` ×5 and `Beebe` ×4
-runs on page 82 come through complete. What remains is an occasional single
-dropped entry, no longer tied to repeat runs.
+runs on page 82 come through complete.
+
+**What "missing" turned out to mean afterwards: rewritten surnames.** Auditing
+the first full 10-page run with this roster showed no true omissions at all.
+Every entry QA flagged as missed was present with all its data under a
+*misspelled surname*: the model normalises rare names toward its prior or
+toward the neighbouring run (`Bear, Firman E.` came back as *Bean* amid four
+printed Beans; `Becket` as *Beckett*; `Beetle` as *Beattie*; `Beilby` as
+*Belhy*), plus a recurring C↔O glyph confusion (`C(laus)` → `O(laus)`). More
+reasoning does not fix this — it is the language prior overriding the pixels.
+
+**Fix: the print-layer spelling cross-check** described under *How it works*.
+The PDF's own OCR read every one of those names correctly — the two readers
+fail in different ways — so feeding the OCR headings into the prompt as the
+spelling authority removed **all 8 surname corruptions on the four affected
+pages**, at a cost of a few hundred input tokens per page. One caution is
+baked into the prompt wording: the heading list must never be treated as the
+roster. In one early trial the model anchored to an 11-item list on a 12-entry
+page and dropped the entry the OCR had garbled (`Belknap`); the list patterns
+were widened and the prompt now states explicitly that the list routinely
+misses headings and the image alone decides what exists, after which the page
+returned 12/12 with every spelling correct.
 
 **Multi-pass merge (off by default).** With `--max-passes` above 1 the text
 layer is consulted after each page, and if it says the pass came up short the

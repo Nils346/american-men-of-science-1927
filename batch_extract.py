@@ -31,6 +31,7 @@ import fitz
 from openai import OpenAI
 
 import extract_panel as ep
+import qa_check
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                     datefmt="%H:%M:%S")
@@ -68,7 +69,8 @@ def build_request_lines(doc, pages: list[int], client: ep.ExtractionClient,
         focus_png = ep.render_page_png(doc, page - 1, dpi)
         lookahead_png = (ep.render_page_png(doc, page, dpi)
                          if page < doc.page_count else None)
-        content = ep.build_user_content(page, focus_png, lookahead_png)
+        content = ep.build_user_content(page, focus_png, lookahead_png,
+                                        qa_check.printed_headings(doc, page))
         line = json.dumps({
             "custom_id": custom_id_for(page),
             "method": "POST",
