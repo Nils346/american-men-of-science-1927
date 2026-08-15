@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -32,24 +33,31 @@ DEFAULT_EVENTS = "scientist_events_long.csv"
 INST_COL = "institution"
 
 
-def collect_institutions(raw_path: Path) -> set[str]:
+def collect_institutions(raw_path: Path) -> Counter:
+    """Every institution string with the number of events it appears in.
+
+    The distribution is heavy-tailed (a few universities carry most of the
+    events, thousands of companies/hospitals appear once), so the count is
+    what makes hand-coding tractable: sorted by it, the first few hundred
+    rows buy most of the coverage.
+    """
     profiles = json.loads(raw_path.read_text(encoding="utf-8"))
-    names: set[str] = set()
+    counts: Counter = Counter()
     for p in profiles:
         for deg in p.get("education") or []:
             inst = (deg.get("institution") or "").strip()
             if inst:
-                names.add(inst)
+                counts[inst] += 1
         for job in p.get("employment") or []:
             inst = (job.get("institution_org") or "").strip()
             if inst:
-                names.add(inst)
+                counts[inst] += 1
         for mp in p.get("minor_positions") or []:
             if isinstance(mp, dict):
                 inst = (mp.get("institution_org") or "").strip()
                 if inst:
-                    names.add(inst)
-    return names
+                    counts[inst] += 1
+    return counts
 
 
 def export_locations(raw_path: Path, locations_path: Path) -> None:
@@ -65,28 +73,38 @@ def export_locations(raw_path: Path, locations_path: Path) -> None:
                 "institution,city,state_region,country,notes\n", encoding="utf-8"
             )
 
-    discovered = sorted(collect_institutions(raw_path))
+    counts = collect_institutions(raw_path)
     existing = pd.read_csv(locations_path, dtype=str).fillna("")
     if INST_COL not in existing.columns:
         raise SystemExit(f"{locations_path.name} must have an '{INST_COL}' column.")
     coded = set(existing[INST_COL].str.strip())
     rows = existing.to_dict("records")
 
-    new_names = [n for n in discovered if n not in coded]
+    new_names = [n for n in counts if n not in coded]
     for name in new_names:
         rows.append({
             INST_COL: name,
+            "n_events": "",
             "city": "",
             "state_region": "",
             "country": "",
             "notes": "",
         })
 
-    out = pd.DataFrame(rows, columns=[INST_COL, "city", "state_region", "country", "notes"])
-    out = out.sort_values(INST_COL, kind="stable").reset_index(drop=True)
+    out = pd.DataFrame(rows, columns=[INST_COL, "n_events", "city",
+                                      "state_region", "country", "notes"])
+    # Refresh every count (also for rows already coded) and sort by it, so the
+    # top of the file is always where an hour of hand-coding buys the most.
+    out["n_events"] = out[INST_COL].str.strip().map(counts).fillna(0).astype(int)
+    out = out.sort_values(["n_events", INST_COL],
+                          ascending=[False, True], kind="stable").reset_index(drop=True)
     out.to_csv(locations_path, index=False, encoding="utf-8-sig")
+    n_total = sum(counts.values())
+    covered = out.loc[out[["city", "state_region", "country"]].replace("", pd.NA)
+                      .notna().any(axis=1), "n_events"].sum()
     print(f"Wrote {locations_path.name}: {len(out)} institutions "
-          f"({len(new_names)} newly added, {len(discovered)} total in raw data).")
+          f"({len(new_names)} newly added). Coded rows currently cover "
+          f"{covered}/{n_total} institution events ({covered / max(n_total, 1):.0%}).")
 
 
 def load_location_lookup(locations_path: Path) -> pd.DataFrame:
