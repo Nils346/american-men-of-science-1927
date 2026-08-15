@@ -45,8 +45,36 @@ always safe, completed pages are skipped.
 | `scientists_raw.json` | Full nested model output; all CSVs rebuild from it via `--panel-only`. |
 
 Multi-value cells use ` | ` as separator (never `;`, which breaks Excel in
-several locales). Optional: hand-code institution locations with
-`python merge_institution_locations.py --export` → fill the CSV → `--apply`.
+several locales).
+
+### Institution locations (evidence-based, then hand-verified)
+
+Birth places and 1927 mailing addresses come geo-parsed from the book itself.
+Career institutions are located via a bridge file:
+
+```powershell
+python merge_institution_locations.py --export   # build/refresh the bridge
+#  -> institution_locations.csv, sorted by event count, PREFILLED from the
+#     book's own mailing addresses (an address naming the institution locates
+#     it; majority vote across scientists; provenance in the notes column)
+#  verify/extend in Excel, blank anything doubtful, then:
+python merge_institution_locations.py --apply    # locations onto the events table
+```
+
+Prefills use no outside knowledge — only printed addresses — and the export
+never overwrites hand-coded cells. On the sample, address evidence alone
+located the institutions behind a third of all career events.
+
+### Publishable release
+
+```powershell
+python build_release.py
+```
+
+Writes `release/`: four clean CSVs (scientist-year panel, dated career events
+with locations, one-row-per-scientist file, institution bridge) plus
+`codebook.xlsx` documenting every column, the construction method, and
+coverage counts. No QA flags or working files — this is the version to share.
 
 ## How it works
 
