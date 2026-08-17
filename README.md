@@ -9,18 +9,25 @@ guessed; unverifiable values are removed and flagged, not invented.
 
 ## The dataset
 
+**Current build** (Batch API, 15 Aug 2026): 1,110 pages, **13,003 scientists**,
+1,405 starred, 606,903 scientist-year rows, 109,652 dated events. Cost
+**$103.84**. Institution locations: 1,280 of 17,840 unique strings prefilled
+from printed mailing addresses, covering **59% of career events** — still
+needs a human pass before treating geography as final.
+
 Built into `release/` (by step 6 below), documented column-by-column in
 `release/codebook.xlsx`:
 
 | File | What it is |
 | --- | --- |
 | **`scientist_year_panel_1927.csv`** | **The main output.** One row per scientist per year (birth–1927). Degrees, positions, and parallel roles per year in numbered slots; activity filled only where the book confirms it. |
-| **`institution_locations_1927.csv`** | **The location bridge.** Institution string → city/state/country. Prefilled from the book's own mailing addresses, hand-verified; join it to any institution column. |
+| **`institution_locations_1927.csv`** | **The location bridge.** Institution string → city/state/country. Prefilled from the book's own mailing addresses; join it to any institution column. Verify in `institution_locations.csv` before publishing. |
 | `career_events_1927.csv` | One row per dated degree/position with its printed year span and location. |
 | `scientists_1927.csv` | One row per scientist: identity, birthplace, field, star status, societies, research. |
 
 The working copy of the bridge (`institution_locations.csv`, tracked in git)
-is the one file that accumulates irreplaceable hand work.
+is the one file that accumulates irreplaceable hand work. Rows whose `notes`
+start with `auto:` are mailing-address proposals, not yet verified.
 
 ## Replicate from scratch
 
@@ -115,13 +122,12 @@ all surface as flags.
 Default `gpt-5.6-sol`, chosen over the cheaper `gpt-5.6-terra` on a measured
 A/B (half the surname misreads; surnames are the linking key). Reasoning
 effort `low` — higher effort doubled tokens with no accuracy gain. Measured
-$0.099/page through the Batch API:
+$0.094/page through the Batch API on the full run:
 
 | Full run (1,110 pages) | Cost |
 | --- | ---: |
-| `gpt-5.6-sol`, Batch API (default) | **~$110** |
-| + re-extraction buffer (~15%) | ~$127 |
-| `gpt-5.6-sol`, live calls | ~$220 |
+| `gpt-5.6-sol`, Batch API — **actual** | **$103.84** |
+| `gpt-5.6-sol`, live calls (would have been) | $207.68 |
 
 ## CLI reference (`extract_panel.py`)
 
