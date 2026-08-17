@@ -55,6 +55,7 @@ python qa_check.py
 # 4. Institution locations: prefill from mailing addresses, verify in Excel,
 #    optionally hand-code more of the frequency-sorted list, then apply
 python merge_institution_locations.py --export
+python merge_institution_locations.py --propose   # optional: AI-draft frequent leftovers
 python merge_institution_locations.py --apply
 
 # 5. Spot-check red/amber rows in review_workbook.xlsx (frozen panes, QA flags)

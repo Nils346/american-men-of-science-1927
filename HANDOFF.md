@@ -253,7 +253,7 @@ PDF page images ──► OpenAI Responses API (gpt-5.6-sol, structured JSON)
 | `qa_check.py` | OCR cross-check + birth repair + findings CSV |
 | `profile_merge.py` | Multi-pass union (default unused) |
 | `review_workbook.py` | Excel for hand verification |
-| `merge_institution_locations.py` | Bridge export / address prefill / apply |
+| `merge_institution_locations.py` | Bridge: export, address prefill, `--propose` (AI classify-then-locate), apply |
 | `build_release.py` | Publishable CSVs + codebook.xlsx |
 
 Default model: `gpt-5.6-sol`. Env: `OPENAI_API_KEY`. Pages: 14–1123.
@@ -345,6 +345,7 @@ then `python batch_extract.py submit` for just those pages (or live
    Coding the top few hundred strings covers most events. Then:
 
    ```powershell
+   python merge_institution_locations.py --propose   # AI classifies then locates
    python merge_institution_locations.py --apply
    python build_release.py
    ```
@@ -394,6 +395,7 @@ python qa_check.py --pages 75 84
 
 # locations
 python merge_institution_locations.py --export
+python merge_institution_locations.py --propose --min-events 20
 python merge_institution_locations.py --apply
 
 # publishable folder
