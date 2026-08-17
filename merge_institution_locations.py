@@ -37,7 +37,9 @@ import argparse
 import json
 import os
 import re
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 
 import pandas as pd
@@ -294,7 +296,15 @@ def _empty_geo(row) -> bool:
                    for c in ("city", "state_region", "country"))
 
 
-def _propose_batch(client, model: str, names: list[str]) -> tuple[list[dict], dict]:
+_SONNET5_IN = 2.0 / 1_000_000
+_SONNET5_OUT = 10.0 / 1_000_000
+
+
+def _usd_sonnet5(input_tokens: int, output_tokens: int) -> float:
+    return input_tokens * _SONNET5_IN + output_tokens * _SONNET5_OUT
+
+
+def _propose_batch_openai(client, model: str, names: list[str]) -> tuple[list[dict], dict]:
     numbered = "\n".join("%d. %s" % (i + 1, n) for i, n in enumerate(names))
     kwargs = dict(
         model=model,
@@ -334,6 +344,45 @@ def _propose_batch(client, model: str, names: list[str]) -> tuple[list[dict], di
     }
 
 
+def _propose_batch_anthropic(client, model: str, names: list[str]) -> tuple[list[dict], dict]:
+    numbered = "\n".join("%d. %s" % (i + 1, n) for i, n in enumerate(names))
+    kwargs = dict(
+        model=model,
+        max_tokens=4000,
+        system=LOCATE_PROMPT,
+        messages=[{"role": "user", "content":
+                   "Classify and, if locatable, site these printed strings:\n\n"
+                   + numbered}],
+        tools=[{
+            "name": "institution_locations",
+            "description": "Classifications and locations for every listed string.",
+            "input_schema": _PROPOSE_SCHEMA,
+        }],
+        tool_choice={"type": "tool", "name": "institution_locations"},
+        thinking={"type": "disabled"},
+    )
+    try:
+        resp = client.messages.create(**kwargs)
+    except Exception as exc:
+        if "thinking" in str(exc).lower():
+            kwargs.pop("thinking", None)
+            resp = client.messages.create(**kwargs)
+        else:
+            raise
+    payload = None
+    for block in resp.content:
+        if getattr(block, "type", None) == "tool_use" and block.name == "institution_locations":
+            payload = block.input
+            break
+    if not payload:
+        raise RuntimeError("Claude returned no tool payload")
+    usage = resp.usage
+    return payload["items"], {
+        "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+    }
+
+
 def _accept_proposal(raw: dict, wanted: set[str]) -> tuple[str, dict] | None:
     """Return (institution, fields) or None if the model failed the check."""
     inst = (raw.get("institution") or "").strip()
@@ -367,46 +416,78 @@ def _accept_proposal(raw: dict, wanted: set[str]) -> tuple[str, dict] | None:
 
 
 def propose_locations(locations_path: Path, min_events: int, model: str,
-                      batch_size: int, api_key: str | None) -> None:
-    """AI-draft locations for frequent empty rows; skip anything already coded."""
-    from openai import OpenAI
+                      batch_size: int, api_key: str | None,
+                      provider: str = "openai", max_spend: float | None = None,
+                      workers: int = 1) -> None:
+    """AI-draft locations for empty rows, highest-frequency first.
 
+    Never overwrites mailing-address or hand-coded cells. Stops before
+    max_spend (USD) when set. Writes the CSV after every successful batch.
+    """
     if not locations_path.exists():
         raise SystemExit("Missing %s -- run --export first." % locations_path.name)
     df = pd.read_csv(locations_path, dtype=str).fillna("")
     df["n_events"] = pd.to_numeric(df["n_events"], errors="coerce").fillna(0).astype(int)
     empty = df.apply(_empty_geo, axis=1) & (df["n_events"] >= min_events)
     empty = empty & ~df["notes"].astype(str).str.startswith("ai:")
-    targets = df.loc[empty, INST_COL].str.strip().tolist()
+    targets = (df.loc[empty]
+               .sort_values("n_events", ascending=False)[INST_COL]
+               .str.strip().tolist())
     if not targets:
         print("No empty institutions with n_events >= %d." % min_events)
         return
 
-    key = api_key or os.environ.get("OPENAI_API_KEY")
-    if not key:
-        raise SystemExit("Set OPENAI_API_KEY or pass --api-key.")
-    client = OpenAI(api_key=key)
+    if provider == "anthropic":
+        import anthropic
+        key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not key:
+            raise SystemExit("Set ANTHROPIC_API_KEY or pass --api-key.")
+        client = anthropic.Anthropic(api_key=key, timeout=90.0)
+        call = lambda names: _propose_batch_anthropic(client, model, names)
+    else:
+        from openai import OpenAI
+        key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise SystemExit("Set OPENAI_API_KEY or pass --api-key.")
+        client = OpenAI(api_key=key)
+        call = lambda names: _propose_batch_openai(client, model, names)
 
-    print("Proposing locations for %d strings (n_events >= %d), model %s ..."
-          % (len(targets), min_events, model))
-    filled = skipped = failed = 0
+    chunks = [targets[i:i + batch_size] for i in range(0, len(targets), batch_size)]
+    workers = max(1, workers)
+    print("Proposing locations for %d strings (%d batches, %d workers), "
+          "%s / %s%s ..."
+          % (len(targets), len(chunks), workers, provider, model,
+             "" if max_spend is None else ", cap $%.2f" % max_spend))
+
+    filled = skipped = failed = done_n = 0
     in_tok = out_tok = 0
+    spent = 0.0
     by_name: dict[str, dict] = {}
-    for start in range(0, len(targets), batch_size):
-        chunk = targets[start:start + batch_size]
-        try:
-            items, usage = _propose_batch(client, model, chunk)
-        except Exception as exc:  # noqa: BLE001
-            msg = str(exc)
-            print("  batch %d–%d failed: %s" % (start + 1, start + len(chunk), exc))
-            if "insufficient_quota" in msg or "credit_balance" in msg or "429" in msg:
-                print("Stopping: no API credits. Top up and re-run --propose; "
-                      "already-coded rows are untouched.")
-                break
-            failed += len(chunk)
-            continue
+    lock = threading.Lock()
+    halt = False
+
+    def flush() -> pd.DataFrame:
+        for i in df.index:
+            name = str(df.at[i, INST_COL]).strip()
+            if name not in by_name or not _empty_geo(df.loc[i]):
+                continue
+            fields = by_name[name]
+            df.at[i, "city"] = fields["city"]
+            df.at[i, "state_region"] = fields["state_region"]
+            df.at[i, "country"] = fields["country"]
+            df.at[i, "notes"] = fields["notes"]
+        out = df.sort_values(["n_events", INST_COL],
+                             ascending=[False, True], kind="stable").reset_index(drop=True)
+        out.to_csv(locations_path, index=False, encoding="utf-8-sig")
+        return out
+
+    def absorb(chunk: list[str], items: list[dict], usage: dict) -> float:
+        nonlocal filled, skipped, failed, done_n, in_tok, out_tok, spent, df
+        cost = _usd_sonnet5(usage["input_tokens"], usage["output_tokens"])
         in_tok += usage["input_tokens"]
         out_tok += usage["output_tokens"]
+        spent += cost
+        done_n += len(chunk)
         wanted = set(chunk)
         for raw in items:
             got = _accept_proposal(raw, wanted)
@@ -419,31 +500,66 @@ def propose_locations(locations_path: Path, min_events: int, model: str,
                 filled += 1
             else:
                 skipped += 1
-        print("  %d/%d ..." % (min(start + batch_size, len(targets)), len(targets)))
+        df = flush()
+        print("  %d/%d  filled %d  blank %d  spent $%.3f (batch $%.3f)"
+              % (done_n, len(targets), filled, skipped, spent, cost))
+        return cost
 
-    for i in df.index:
-        name = str(df.at[i, INST_COL]).strip()
-        if name not in by_name or not _empty_geo(df.loc[i]):
-            continue
-        fields = by_name[name]
-        df.at[i, "city"] = fields["city"]
-        df.at[i, "state_region"] = fields["state_region"]
-        df.at[i, "country"] = fields["country"]
-        df.at[i, "notes"] = fields["notes"]
+    def run_one(chunk: list[str]):
+        return chunk, call(chunk)
 
-    df = df.sort_values(["n_events", INST_COL],
-                        ascending=[False, True], kind="stable").reset_index(drop=True)
-    df.to_csv(locations_path, index=False, encoding="utf-8-sig")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        chunk_iter = iter(chunks)
+        futures = set()
+
+        def pump() -> None:
+            nonlocal halt
+            while len(futures) < workers:
+                if halt:
+                    return
+                if max_spend is not None and spent + 0.03 * (len(futures) + 1) >= max_spend:
+                    halt = True
+                    return
+                nxt = next(chunk_iter, None)
+                if nxt is None:
+                    return
+                futures.add(pool.submit(run_one, nxt))
+
+        pump()
+        while futures:
+            finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                try:
+                    chunk, (items, usage) = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    print("  batch failed: %s" % exc)
+                    if any(s in msg.lower() for s in (
+                            "insufficient_quota", "credit_balance", "credit",
+                            "billing", "429")):
+                        halt = True
+                        print("Stopping: API credits/rate. Progress is saved.")
+                    else:
+                        failed += 1
+                    continue
+                with lock:
+                    absorb(chunk, items, usage)
+                    if max_spend is not None and spent + 0.12 >= max_spend:
+                        halt = True
+                        print("Stopping before further batches (spend cap $%.2f)."
+                              % max_spend)
+            if not halt:
+                pump()
+
     located = df[["city", "state_region", "country"]].replace("", pd.NA).notna().any(axis=1)
     print("Wrote %s: filled %d, left blank (not a place / ambiguous / failed "
           "check) %d, unmatched replies %d. Located rows now cover %d/%d "
-          "events (%.0f%%)."
+          "events (%.0f%%). Estimated spend $%.2f (%d in + %d out tokens)."
           % (locations_path.name, filled, skipped, failed,
              int(df.loc[located, "n_events"].sum()),
              int(df["n_events"].sum()),
-             100 * df.loc[located, "n_events"].sum() / max(int(df["n_events"].sum()), 1)))
-    print("Token usage: %d input + %d output. Notes starting 'ai:' are drafts."
-          % (in_tok, out_tok))
+             100 * df.loc[located, "n_events"].sum() / max(int(df["n_events"].sum()), 1),
+             spent, in_tok, out_tok))
 
 
 def load_location_lookup(locations_path: Path) -> pd.DataFrame:
@@ -502,8 +618,13 @@ def main() -> None:
     parser.add_argument("--min-events", type=int, default=20,
                         help="--propose: only empty strings with at least this many events.")
     parser.add_argument("--model", default="gpt-5.6-terra",
-                        help="--propose: text model (default gpt-5.6-terra, cheap).")
+                        help="--propose model (OpenAI default gpt-5.6-terra; Anthropic: claude-sonnet-5).")
+    parser.add_argument("--provider", default="openai", choices=["openai", "anthropic"])
+    parser.add_argument("--max-spend", type=float, default=None,
+                        help="Stop --propose before estimated USD spend exceeds this.")
     parser.add_argument("--batch-size", type=int, default=25)
+    parser.add_argument("--workers", type=int, default=1,
+                        help="--propose: parallel API calls (try 8–12).")
     parser.add_argument("--api-key", default=None)
     args = parser.parse_args()
     base = Path(__file__).resolve().parent
@@ -512,7 +633,9 @@ def main() -> None:
         export_locations(base / args.raw, base / args.locations)
     elif args.propose:
         propose_locations(base / args.locations, args.min_events, args.model,
-                          args.batch_size, args.api_key)
+                          args.batch_size, args.api_key,
+                          provider=args.provider, max_spend=args.max_spend,
+                          workers=args.workers)
     elif args.apply:
         apply_locations(
             base / args.events,
