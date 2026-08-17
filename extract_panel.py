@@ -1190,6 +1190,31 @@ def pipe_join(*chunks) -> Optional[str]:
     return " | ".join(parts) if parts else None
 
 
+def cap_spell(start: Optional[int], end: Optional[int],
+              is_current: bool = False,
+              directory_year: int = DIRECTORY_YEAR
+              ) -> tuple[Optional[int], Optional[int], bool]:
+    """Drop years the 1927 directory cannot confirm (after the edition year).
+
+    A spell that began by 1927 and overshoots (printed or misread as 20-28) is
+    clipped to 1927. A spell that only exists after 1927 is removed entirely --
+    we do not turn it into a fake 1927 confirmation.
+    """
+    started_by_edition = start is not None and start <= directory_year
+    future_only = (
+        (start is None or start > directory_year)
+        and (end is None or end > directory_year)
+        and (start is not None or end is not None)
+    )
+    if start is not None and start > directory_year:
+        start = None
+    if end is not None and end > directory_year:
+        end = directory_year if started_by_edition else None
+    if future_only:
+        is_current = False
+    return start, end, is_current
+
+
 def confirmed_years(start: Optional[int], end: Optional[int],
                     is_current: bool, directory_year: int = DIRECTORY_YEAR) -> list[int]:
     """Return the years for which a spell is CONFIRMED (never interpolated).
@@ -1202,16 +1227,21 @@ def confirmed_years(start: Optional[int], end: Optional[int],
     - Only an end year: [end] alone.
     - Current position with NO dates at all: [directory_year] -- the one year
       the directory itself vouches for.
+
+    Years after the edition year are never returned.
     """
+    start, end, is_current = cap_spell(start, end, is_current, directory_year)
     if start is not None and end is not None:
         if end < start:
             start, end = end, start
-        return list(range(start, end + 1))
-    if start is not None:
-        return list(range(start, directory_year + 1)) if is_current else [start]
-    if end is not None:
-        return [end]
-    return [directory_year] if is_current else []
+        years = list(range(start, end + 1))
+    elif start is not None:
+        years = (list(range(start, directory_year + 1)) if is_current else [start])
+    elif end is not None:
+        years = [end]
+    else:
+        years = [directory_year] if is_current else []
+    return [y for y in years if y <= directory_year]
 
 
 def _infer_country(state: Optional[str]) -> Optional[str]:
@@ -1491,7 +1521,7 @@ def build_panel(profiles: list[dict]) -> pd.DataFrame:
             rows.append({**inv, "year": None, "age": None, **blank_slots(),
                          "is_current_1927_role": 0, "activity_confirmed": 0})
             continue
-        end_span = max(DIRECTORY_YEAR, max(dated)) if dated else DIRECTORY_YEAR
+        end_span = DIRECTORY_YEAR
 
         for y in range(start_span, end_span + 1):
             ev = events.get(y)
@@ -1555,31 +1585,38 @@ def build_events_long(profiles: list[dict]) -> pd.DataFrame:
         inv = profile_invariants(p)
 
         for deg in p.get("education") or []:
+            year, end_year, _ = cap_spell(deg.get("year"), deg.get("end_year"))
             rows.append({
                 **inv, "record_type": "Education",
-                "start_year": deg.get("year"),
-                "end_year": deg.get("end_year") or deg.get("year"),
+                "start_year": year,
+                "end_year": end_year or year,
                 "institution_organization": normalize_ocr(deg.get("institution")),
                 "role_or_degree": normalize_ocr(deg.get("degree_type") or "study"),
                 "is_current_1927_role": 0,
             })
         for job in p.get("employment") or []:
+            start, end, is_cur = cap_spell(
+                job.get("start_year"), job.get("end_year"),
+                bool(job.get("is_current_position")))
             rows.append({
                 **inv, "record_type": "Employment",
-                "start_year": job.get("start_year"), "end_year": job.get("end_year"),
+                "start_year": start, "end_year": end,
                 "institution_organization": normalize_ocr(job.get("institution_org")),
                 "role_or_degree": normalize_ocr(job.get("position_title")),
-                "is_current_1927_role": 1 if job.get("is_current_position") else 0,
+                "is_current_1927_role": 1 if is_cur else 0,
             })
         for mp in p.get("minor_positions") or []:
             if not isinstance(mp, dict):
                 continue
+            start, end, is_cur = cap_spell(
+                mp.get("start_year"), mp.get("end_year"),
+                bool(mp.get("is_current_position")))
             rows.append({
                 **inv, "record_type": "MinorPosition",
-                "start_year": mp.get("start_year"), "end_year": mp.get("end_year"),
+                "start_year": start, "end_year": end,
                 "institution_organization": normalize_ocr(mp.get("institution_org")),
                 "role_or_degree": normalize_ocr(mp.get("position_title")),
-                "is_current_1927_role": 1 if mp.get("is_current_position") else 0,
+                "is_current_1927_role": 1 if is_cur else 0,
             })
 
     df = pd.DataFrame(rows)

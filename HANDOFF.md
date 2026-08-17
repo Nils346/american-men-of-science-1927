@@ -91,7 +91,7 @@ Principles the user insisted on throughout:
 | Pages | 1,110 (PDF 14–1123) |
 | Scientists | 13,003 |
 | Starred | 1,405 |
-| Scientist-year rows | 606,903 |
+| Scientist-year rows | 606,865 |
 | Dated events | 109,652 |
 | Unique institution strings | 17,840 |
 | Institution strings located | 3,565 (mailing address + AI draft + hand) |
@@ -428,7 +428,9 @@ Environment: `OPENAI_API_KEY`. Model: `gpt-5.6-sol`.
 - Institution geography from printed addresses + tagged AI drafts + human
   coding, not unsupervised geocoding APIs. Dual-city / non-place strings stay blank.
 - Public artifact is clean CSVs + formatted Excel + codebook, not the QA workbook.
-- Panel is balanced scientist-year, activity only where confirmed.
+- Panel is balanced scientist-year, activity only where confirmed. The
+  calendar never extends past 1927: overshooting end dates (model `1928`)
+  are clipped; spells that only exist after 1927 are dropped.
 - Release tables are sorted in book order (PDF page, surname, year).
 
 ---

@@ -220,7 +220,8 @@ def _header_fmt(wb, wrap=False):
     })
 
 
-def _cell_fmt(wb, wrap=False, zebra=False, fill=None, center=False, bold=False):
+def _cell_fmt(wb, wrap=False, zebra=False, fill=None, center=False, bold=False,
+              top=None):
     spec = {
         "font_name": "Calibri", "font_size": 10, "valign": "vcenter",
         "text_wrap": wrap,
@@ -230,6 +231,9 @@ def _cell_fmt(wb, wrap=False, zebra=False, fill=None, center=False, bold=False):
         spec["align"] = "center"
     if bold:
         spec["bold"] = True
+    if top:
+        spec["top"] = top
+        spec["top_color"] = NAVY
     return wb.add_format(spec)
 
 
@@ -250,13 +254,16 @@ def _col_width(name: str, series: pd.Series) -> float:
 def _write_sheet(wb, sheet_name: str, df: pd.DataFrame, *,
                  freeze_cols: int = 2, wrap: set[str] | None = None,
                  stripe: bool = False, source_col: str | None = None,
-                 constant_memory: bool = False, progress: str | None = None) -> None:
+                 constant_memory: bool = False, progress: str | None = None,
+                 group_cols: list[str] | None = None) -> None:
     wrap = wrap or set()
+    group_cols = [c for c in (group_cols or []) if c in df.columns]
     ws = wb.add_worksheet(sheet_name[:31])
     header = _header_fmt(wb, wrap=True)
 
     cols = list(df.columns)
     n_rows, n_cols = len(df), len(cols)
+    group_idx = [cols.index(c) for c in group_cols]
     ws.freeze_panes(1, freeze_cols)
     ws.set_row(0, 28)
     ws.set_default_row(18)
@@ -279,13 +286,21 @@ def _write_sheet(wb, sheet_name: str, df: pd.DataFrame, *,
     records = df.itertuples(index=False, name=None)
 
     # Large sheets: one body format + write_row (42M per-cell calls would take hours).
+    # A thick navy top border marks the first row of each new scientist.
     if constant_memory:
         body = _cell_fmt(wb)
+        body_break = _cell_fmt(wb, top=5)
+        prev = None
         for r, row in enumerate(records, start=1):
             if progress and r % 50_000 == 0:
                 print("    %s %s / %s rows" % (progress, f"{r:,}", f"{n_rows:,}"))
             vals = ["" if (x := _cell(v)) is None else x for v in row]
-            ws.write_row(r, 0, vals, body)
+            key = tuple(row[i] for i in group_idx) if group_idx else None
+            new_person = bool(group_idx) and key != prev and r > 1
+            if new_person:
+                ws.set_row(r, 20)
+            ws.write_row(r, 0, vals, body_break if new_person else body)
+            prev = key
         return
 
     even = _cell_fmt(wb)
@@ -401,11 +416,14 @@ def write_events_xlsx(df: pd.DataFrame, stats: dict) -> None:
          "mailing address = taken from a printed 1927 address that names the institution. "
          "AI = classify-then-locate draft, not yet hand-verified. "
          "hand = typed in by a person. Blank = not coded, never guessed."),
+        ("Scientist breaks",
+         "A thick navy line marks where one scientist's events end and the next begin."),
     ])
     _write_sheet(wb, "Career events", df, freeze_cols=2,
                  wrap={"institution_organization", "role_or_degree"},
                  source_col="institution_location_source",
-                 constant_memory=True, progress="events")
+                 constant_memory=True, progress="events",
+                 group_cols=["source_pdf_page", "scientist_name"])
     wb.close()
 
 
@@ -423,10 +441,15 @@ def write_panel_xlsx(df: pd.DataFrame, stats: dict) -> None:
         ("Activity confirmed",
          "1 only when the directory itself dates a degree or a spell in that year. "
          "Gaps are left blank — never interpolated."),
+        ("Scientist breaks",
+         "A thick navy line across the sheet marks where one scientist ends and "
+         "the next begins. Freeze Page + Scientist, then scroll: each block is "
+         "one person's years."),
     ])
     wrap = {c for c in df.columns if "research" in c}
     _write_sheet(wb, "Scientist-year panel", df, freeze_cols=2, wrap=wrap,
-                 constant_memory=True, progress="panel")
+                 constant_memory=True, progress="panel",
+                 group_cols=["source_pdf_page", "scientist_name"])
     wb.close()
 
 
