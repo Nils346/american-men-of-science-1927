@@ -26,7 +26,8 @@ Workflow
 3. Fill in / verify city / state_region / country by hand in Excel.
 4. Apply:            python merge_institution_locations.py --apply
    -> writes scientist_events_long.csv with institution_city/state/country
-      columns (only where filled in; never guesses).
+      and institution_location_source (mailing address / AI / hand).
+      Only filled rows merge; never guesses.
 
 Only exact institution-string matches are merged. Leave cells blank when unsure.
 """
@@ -562,6 +563,16 @@ def propose_locations(locations_path: Path, min_events: int, model: str,
              spent, in_tok, out_tok))
 
 
+def source_from_notes(notes: str) -> str:
+    """How a location was assigned -- for the publishable bridge file."""
+    n = (notes or "").strip()
+    if n.startswith("auto:"):
+        return "mailing address"
+    if n.startswith("ai:"):
+        return "AI"
+    return "hand"
+
+
 def load_location_lookup(locations_path: Path) -> pd.DataFrame:
     if not locations_path.exists():
         raise SystemExit(f"Missing {locations_path.name}. Run --export first.")
@@ -570,7 +581,7 @@ def load_location_lookup(locations_path: Path) -> pd.DataFrame:
     for col in ("city", "state_region", "country"):
         loc[col] = loc[col].str.strip()
         loc.loc[loc[col] == "", col] = pd.NA
-    # Drop rows with no geography filled in.
+    loc["source"] = loc["notes"].map(source_from_notes) if "notes" in loc.columns else "hand"
     loc = loc.dropna(subset=["city", "state_region", "country"], how="all")
     return loc.drop_duplicates(subset=[INST_COL], keep="first")
 
@@ -580,6 +591,12 @@ def apply_locations(events_path: Path, locations_path: Path, output_path: Path |
         raise SystemExit(f"Missing {events_path.name}. Run extract_panel.py --panel-only first.")
 
     events = pd.read_csv(events_path, dtype=str)
+    leftover = [
+        "n_events", "notes",
+        "institution_city", "institution_state_region", "institution_country",
+        "institution_location_source",
+    ]
+    events = events.drop(columns=[c for c in leftover if c in events.columns])
     lookup = load_location_lookup(locations_path)
     if lookup.empty:
         print("No coded locations found (all geography columns blank). Nothing to merge.")
@@ -591,7 +608,12 @@ def apply_locations(events_path: Path, locations_path: Path, output_path: Path |
             "city": "institution_city",
             "state_region": "institution_state_region",
             "country": "institution_country",
-        }),
+            "source": "institution_location_source",
+        })[[
+            "institution_organization", "institution_city",
+            "institution_state_region", "institution_country",
+            "institution_location_source",
+        ]],
         on="institution_organization",
         how="left",
     )

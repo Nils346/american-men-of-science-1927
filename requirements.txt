@@ -5,3 +5,4 @@ pydantic>=2.13
 pandas>=3.0
 tenacity>=9.1
 openpyxl>=3.1
+xlsxwriter>=3.2

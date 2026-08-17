@@ -1539,7 +1539,7 @@ def build_panel(profiles: list[dict]) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
     df = df.sort_values(
-        ["last_name", "first_name", "year"],
+        ["source_pdf_page", "last_name", "first_name", "year"],
         na_position="last", kind="stable",
     ).reset_index(drop=True)
     return df
@@ -1600,7 +1600,7 @@ def build_events_long(profiles: list[dict]) -> pd.DataFrame:
     for col in ("star_status", "is_current_1927_role"):
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     df = df.sort_values(
-        ["last_name", "first_name", "start_year", "record_type"],
+        ["source_pdf_page", "last_name", "first_name", "start_year", "record_type"],
         na_position="last", kind="stable",
     ).reset_index(drop=True)
     return df
@@ -1626,7 +1626,10 @@ def build_summary(profiles: list[dict]) -> pd.DataFrame:
         return df
     df["birth_year"] = pd.to_numeric(df["birth_year"], errors="coerce").astype("Int64")
     df["star_status"] = df["star_status"].astype(int)
-    df = df.sort_values(["last_name", "first_name"], kind="stable").reset_index(drop=True)
+    df = df.sort_values(
+        ["source_pdf_page", "last_name", "first_name"],
+        kind="stable",
+    ).reset_index(drop=True)
     return df
 
 

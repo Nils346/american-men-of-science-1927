@@ -32,11 +32,11 @@ Git does **not** contain the extracted data. Clone is not enough.
 | `extraction_checkpoint.jsonl` (~43 MB) | Every page's raw extraction. Source of truth. |
 | `scientists_raw.json` (~30 MB) | Nested profiles |
 | `scientist_mobility_panel.csv` (~175 MB) | Working panel |
-| `scientist_events_long.csv` (~18 MB) | Dated events (locations already merged) |
+| `scientist_events_long.csv` (~18 MB) | Dated events (locations merged on `--apply`) |
 | `scientist_summary.csv` (~3.5 MB) | One row per scientist |
 | `review_workbook.xlsx` (~4 MB) | Hand-review Excel with QA flags |
 | `qa_findings.csv` | Full QA report |
-| `release/` | Publishable CSVs + codebook |
+| `release/` | Publishable CSVs + formatted Excel + codebook |
 | `institution_locations.csv` | Also in git; the working bridge |
 | `.env` if you used one | API key — do not commit |
 
@@ -94,26 +94,28 @@ Principles the user insisted on throughout:
 | Scientist-year rows | 606,903 |
 | Dated events | 109,652 |
 | Unique institution strings | 17,840 |
-| Institution strings prefilled from mailing addresses | 1,280 |
-| Career events with a location | 61,955 / 105,812 (**59%**) |
+| Institution strings located | 3,565 (mailing address + AI draft + hand) |
+| Career events with a location | 83,930 / 105,812 (**79.3%**) |
 | Cost | **$103.84** (list would have been $207.68) |
 | Failed API pages | **0** |
 
 Headline files for sharing (after `python build_release.py`):
 
-- `release/scientist_year_panel_1927.csv`
-- `release/institution_locations_1927.csv` (only rows that have a city/state/country)
-- `release/career_events_1927.csv`
-- `release/scientists_1927.csv`
+- `release/scientists_1927.xlsx` / `.csv` — open this first
+- `release/scientist_year_panel_1927.xlsx` / `.csv` — main analysis file
+- `release/career_events_1927.xlsx` / `.csv`
+- `release/institution_locations_1927.xlsx` / `.csv` (located rows + `source`)
 - `release/codebook.xlsx`
 
+`source` on the location bridge is one of `mailing address` / `AI` / `hand`.
 Working review file: `review_workbook.xlsx` (red/amber QA flags, frozen panes).
 
 ### What is NOT done
 
-1. **Human verification of `institution_locations.csv`.** Rows with
-   `notes` starting `auto:` are mailing-address proposals. Blank anything
-   wrong. Then `--apply` and `build_release.py` again.
+1. **Human verification of AI location drafts.** Rows whose `notes` start
+   with `ai:` are classify-then-locate proposals, not yet checked. `auto:`
+   rows are mailing-address evidence from the book. Blank anything wrong,
+   then `--apply` and `build_release.py` again.
 2. **Optional re-extraction of 49 QA-flagged pages** (costs money; not done).
    Pages: 96, 117, 175, 176, 259, 260, 287, 304, 313, 332, 341, 352, 389,
    407, 457, 469, 535, 565, 569, 633, 635, 636, 640, 643, 645, 646, 648,
@@ -210,8 +212,15 @@ evidence first. Ambiguous names (Washington, Columbia, Miami Ohio vs Florida)
 and 1927-era companies are where LLMs confidently lie, and there is no
 in-book ground truth to catch it.
 
-`build_release.py` writes clean CSVs + codebook (no QA flags). Panel stays
-CSV (full book is ~600k rows; xlsx is the wrong format).
+`build_release.py` writes analysis CSVs plus formatted Excel (book order,
+frozen Page + Scientist, location `source` tagged). The ~600k-row panel
+xlsx is large; `--no-panel-xlsx` skips only that file.
+
+Claude Sonnet `--propose` (17 Aug 2026) classified leftover strings first
+(university vs `not_a_place` / `ambiguous`) and located only confident
+places. Notes `ai:`. Never overwrote `auto:`. Stopped when Anthropic
+credits hit $0. Coverage rose from 59% to **79%** of events. Bare
+`Berlin` is located (Friedrich-Wilhelms-Universität); tour strings stay blank.
 
 ### Phase 5 — cleanup and full run
 
@@ -254,7 +263,7 @@ PDF page images ──► OpenAI Responses API (gpt-5.6-sol, structured JSON)
 | `profile_merge.py` | Multi-pass union (default unused) |
 | `review_workbook.py` | Excel for hand verification |
 | `merge_institution_locations.py` | Bridge: export, address prefill, `--propose` (AI classify-then-locate), apply |
-| `build_release.py` | Publishable CSVs + codebook.xlsx |
+| `build_release.py` | Publishable CSVs + Excel + codebook.xlsx |
 
 Default model: `gpt-5.6-sol`. Env: `OPENAI_API_KEY`. Pages: 14–1123.
 DPI 150. `--max-passes 1`. `--reasoning-effort low`.
@@ -340,12 +349,11 @@ then `python batch_extract.py submit` for just those pages (or live
 
 ## 8. Next work (priority order)
 
-1. **Verify location prefills.** Open `institution_locations.csv` in Excel.
-   Sorted by `n_events` descending. Check `auto:` notes. Blank wrong rows.
-   Coding the top few hundred strings covers most events. Then:
+1. **Spot-check AI location drafts.** Open `institution_locations.csv` in
+   Excel, sorted by `n_events` descending. Check `ai:` rows (and remaining
+   `auto:` if you have not). Blank anything wrong. Then:
 
    ```powershell
-   python merge_institution_locations.py --propose   # AI classifies then locates
    python merge_institution_locations.py --apply
    python build_release.py
    ```
@@ -417,9 +425,11 @@ Environment: `OPENAI_API_KEY`. Model: `gpt-5.6-sol`.
 - Full-name roster + OCR spelling hint; image decides existence.
 - Single pass, no union-merge by default.
 - Subtractive birth repair at panel build, not a second LLM call.
-- Institution geography from printed addresses + human coding, not geocoding APIs.
-- Release CSVs + codebook, not a flagged workbook, as the public artifact.
+- Institution geography from printed addresses + tagged AI drafts + human
+  coding, not unsupervised geocoding APIs. Dual-city / non-place strings stay blank.
+- Public artifact is clean CSVs + formatted Excel + codebook, not the QA workbook.
 - Panel is balanced scientist-year, activity only where confirmed.
+- Release tables are sorted in book order (PDF page, surname, year).
 
 ---
 
