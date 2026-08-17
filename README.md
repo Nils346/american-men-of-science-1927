@@ -1,5 +1,9 @@
 # American Men of Science (1927) → Scientist-Year Panel
 
+**For a new agent / new machine:** read [HANDOFF.md](HANDOFF.md) first.
+It is the project memory (decisions, full-run stats, QA, what to copy).
+Do not re-extract the book.
+
 Extracts all ~13,500 biographical entries of the *American Men of Science*
 4th edition (1927) from page scans into a clean scientist-year panel for
 mobility/migration research — vision-LLM transcription, cross-validated
