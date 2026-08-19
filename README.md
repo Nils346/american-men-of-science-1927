@@ -1,4 +1,4 @@
-# American Men of Science, 1927
+# American Men of Science - 4th Edition (1927)
 
 This repository turns the 4th edition of *American Men of Science* (Cattell, 1927)
 into a structured dataset for research on scientific careers, mobility, and
